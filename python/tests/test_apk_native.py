@@ -31,6 +31,17 @@ def dex():
     return dexbuild.build(dexbuild.base_spec())[0]
 
 
+def analyzable_apk():
+    """synthetic_apk() of base_spec() with LB;.baz's try pointing at its
+    handler: base_spec()'s points at offset 0 of the handler list (its
+    count), which androguard's Analysis.add() can't match (IndexError, which
+    AnalyzeAPK raises; test_strict.py's base_spec_handler)."""
+    spec = dexbuild.base_spec()
+    spec["codes"]["c_baz"] = dexbuild.code_item(1, 1, 0, bytes.fromhex("0e00"), tries=struct.pack("<IHH", 0, 1, 1),
+                                                handlers=dexbuild.uleb(1) + dexbuild.sleb(0) + dexbuild.uleb(0), n_tries=1)
+    return b.synthetic_apk(dexbuild.build(spec)[0])
+
+
 @pytest.fixture(scope="module")
 def apk_bytes(dex):
     return b.synthetic_apk(dex)
@@ -220,7 +231,7 @@ def test_signing_variants(dex):
     # Cut inside the signer: raises once, then returns what was parsed
     # (nothing), as androguard's cache does.
     a = truncated(10)
-    with pytest.raises(androguard_rs.ApkError):
+    with pytest.raises(struct.error, match="^unpack requires a buffer of 4 bytes$"):
         a.get_certificates_v2()
     assert a.get_certificates_v2() == []
 
@@ -320,7 +331,8 @@ def test_byte_swapped_dex_is_not_skipped(dex):
 # ── Entry points ──────────────────────────────────────────────────────────────
 
 
-def test_analyze_apk(apk_bytes, tmp_path):
+def test_analyze_apk(tmp_path):
+    apk_bytes = analyzable_apk()
     p = tmp_path / "a.apk"
     p.write_bytes(apk_bytes)
     for a, d, dx in (AnalyzeAPK(str(p)), AnalyzeAPK(apk_bytes, raw=True)):

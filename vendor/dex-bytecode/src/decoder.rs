@@ -106,6 +106,39 @@ pub fn decode_one_with_resolver<R: ResolveRef>(
     offset: usize,
     resolver: &R,
 ) -> Result<Instruction, DexError> {
+    match check_one(data, offset, true)? {
+        Checked::Payload(ins) => Ok(ins),
+        Checked::Op(op_byte, len) => {
+            let entry = get_opcode_entry(op_byte);
+            let ref_fmt = |kind: RefKind, idx: u32| {
+                resolver
+                    .resolve(kind, idx)
+                    .unwrap_or_else(|| Instruction::format_ref(kind, idx))
+            };
+            decode_format(data, offset, op_byte, entry, len, ref_fmt)
+        }
+    }
+}
+
+/// What `decode_one_with_resolver` accepts at `offset`, without formatting
+/// a non-payload instruction's operands: `(opcode or payload ident, length
+/// in bytes)`, or the same error. A payload is decoded in full (its
+/// checks need it); its length is its decoded length.
+pub fn decode_length(data: &[u8], offset: usize) -> Result<(u16, u32), DexError> {
+    match check_one(data, offset, false)? {
+        Checked::Payload(ins) => Ok((read_u16(data, offset).unwrap_or(0), ins.length)),
+        Checked::Op(op_byte, len) => Ok((op_byte as u16, len as u32)),
+    }
+}
+
+enum Checked {
+    Payload(Instruction),
+    Op(u8, usize),
+}
+
+/// androguard's validity checks for the instruction at `offset`, in its
+/// order (error messages verbatim).
+fn check_one(data: &[u8], offset: usize, text: bool) -> Result<Checked, DexError> {
     let unit = read_u16(data, offset)
         .ok_or_else(|| DexError::invalid("truncated at first 16-bit unit"))?;
     let op_byte = unit as u8;
@@ -116,7 +149,7 @@ pub fn decode_one_with_resolver<R: ResolveRef>(
     // below are androguard's, verbatim.
     if unit > 0xFF && (op_byte == 0x00 || op_byte == 0xFF) {
         return match get_payload_kind(unit) {
-            Some(payload) => decode_payload(data, offset, payload),
+            Some(payload) => decode_payload(data, offset, payload, text).map(Checked::Payload),
             None => Err(DexError::invalid_owned(format!("Unknown Instruction '0x{:04x}'", unit))),
         };
     }
@@ -161,13 +194,7 @@ pub fn decode_one_with_resolver<R: ResolveRef>(
             high_byte(data, offset) >> 4
         )));
     }
-
-    let ref_fmt = |kind: RefKind, idx: u32| {
-        resolver
-            .resolve(kind, idx)
-            .unwrap_or_else(|| Instruction::format_ref(kind, idx))
-    };
-    decode_format(data, offset, op_byte, entry, len, ref_fmt)
+    Ok(Checked::Op(op_byte, len))
 }
 
 fn decode_format<F>(
@@ -437,7 +464,9 @@ fn format_35_regs(a: u8, c: u8, d: u8, e: u8, f: u8, g: u8) -> String {
 /// its data; packed-switch reads fewer targets when its size overruns the
 /// buffer. The returned length can run past the method: the sweep then just
 /// stops, as androguard's does.
-fn decode_payload(data: &[u8], offset: usize, kind: PayloadKind) -> Result<Instruction, DexError> {
+/// `text`: format the operands (otherwise they are left empty; the checks
+/// and the length are the same).
+fn decode_payload(data: &[u8], offset: usize, kind: PayloadKind, text: bool) -> Result<Instruction, DexError> {
     let rest = &data[offset..];
     let remaining = rest.len() as u64;
     let short_read = || {
@@ -457,7 +486,11 @@ fn decode_payload(data: &[u8], offset: usize, kind: PayloadKind) -> Result<Instr
             if 8 + 4 * targets > remaining {
                 return Err(short_read());
             }
-            let keys = (0..targets).map(|i| py_hex(first_key + i as i64)).collect::<Vec<_>>().join(" ");
+            let keys = if text {
+                (0..targets).map(|i| py_hex(first_key + i as i64)).collect::<Vec<_>>().join(" ")
+            } else {
+                String::new()
+            };
             ("packed-switch-payload", 8 + size * 4, keys)
         }
         PayloadKind::SparseSwitch => {
@@ -469,10 +502,14 @@ fn decode_payload(data: &[u8], offset: usize, kind: PayloadKind) -> Result<Instr
             if 4 + 8 * size > remaining {
                 return Err(short_read());
             }
-            let keys = (0..size as usize)
-                .map(|i| py_hex(read_i32(rest, 4 + 4 * i).unwrap_or(0) as i64))
-                .collect::<Vec<_>>()
-                .join(" ");
+            let keys = if text {
+                (0..size as usize)
+                    .map(|i| py_hex(read_i32(rest, 4 + 4 * i).unwrap_or(0) as i64))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            } else {
+                String::new()
+            };
             ("sparse-switch-payload", 4 + 8 * size, keys)
         }
         PayloadKind::FillArrayData => {
@@ -484,10 +521,13 @@ fn decode_payload(data: &[u8], offset: usize, kind: PayloadKind) -> Result<Instr
             let size = read_u32(rest, 4).unwrap_or(0) as u64;
             let data_len = (size * width + 1) & !1;
             let bytes = &rest[8..(8 + data_len).min(remaining) as usize];
-            let mut s = py_bytes_repr(bytes);
-            s.push_str(" | ");
-            for b in bytes {
-                s.push_str(&format!("\\x{:02x}", b));
+            let mut s = String::new();
+            if text {
+                s = py_bytes_repr(bytes);
+                s.push_str(" | ");
+                for b in bytes {
+                    s.push_str(&format!("\\x{:02x}", b));
+                }
             }
             ("fill-array-data-payload", 8 + data_len, s)
         }

@@ -10,7 +10,7 @@ code objects return them with androguard 4.1.3's exact values.
 
 ```python
 # from androguard.core.dex import Instruction, Instruction11n, Instruction21h, Instruction21s, Instruction31i, Instruction35c
-from androguard_rs.dex import Instruction, Instruction11n, Instruction21h, Instruction21s, Instruction31i, Instruction35c
+from androguard_rs.core.dex import Instruction, Instruction11n, Instruction21h, Instruction21s, Instruction31i, Instruction35c
 ```
 
 `isinstance` checks then hold for the objects the facade returns. Every
@@ -32,17 +32,26 @@ androguard 4.1.3 class for DEX bytecode is there (`Instruction10x` ...
 | `Instruction.*` | `get_name`, `get_op_value`, `get_length`, `get_raw`, `get_hex`, `disasm`, `get_output(idx)`, `show_buff(idx)`, `show(idx)`, `__str__`, `get_operands(idx)`, `get_literals`, `get_kind`, `get_ref_kind`, `get_translated_kind`, `get_ref_off` (t formats), `get_string` (21c/31c); format fields (`A`, `B`, `AA`, `BBBB`, `BBBBBBBB`, `CCCC`, `NNNN`, ...) and `OP`, `length` |
 | payloads | `get_name`, `get_op_value` (the ident), `get_length`, `get_raw`, `get_hex`, `disasm`, `get_output`, `get_operands`, `show_buff`, `get_keys`/`get_values`/`get_targets` (switches), `get_data` (fill-array-data), `add_note`/`get_notes`, `get_formatted_operands`; fields `ident`, `size`, `first_key`, `keys`, `targets`, `element_width`, `data`, `format_general_size`, `OP` |
 
-Natively, `androguard_rs.Apk.instructions(key)` (a signature or a row key, so
-an irregular class's methods each get their own code) returns one method's
+A method's instruction objects are handles made natively for each query
+(`core/src/insn_rows.rs`: `insn_spans()` finds the boundaries and opcodes
+with the decoder's own validity checks, without formatting text): two slots
+each (the method's insns and the byte offset; the opcode is the byte
+there), untracked by the cycle collector, offsets shared int objects.
+Nothing is kept per method on the Python side: `get_instructions()` asked
+twice makes new objects that compare and hash equal to the first ones (an
+instruction is its method's code and offset), not the same objects, as
+androguard's cached list gives (an intentional difference, as is that a
+payload's `add_note()` notes stay on that one object).
+`get_instruction(idx)` / `get_instruction(0, off)` make only the one
+instruction asked for; the boundaries of the last 32 methods asked for are
+kept natively, so stepping through a method instruction by instruction
+decodes it once. The text (`get_output()`, the resolved reference) is
+decoded natively for one instruction when asked for, as androguard formats
+it on every call. Format fields are unpacked from the instruction's own
+bytes on first access, with the struct formats androguard's constructors
+use. (`androguard_rs.Apk.instructions(key)` still returns one method's
 `(insns_bytes, rows)`, each row `(offset, op_value, length, raw_len,
-get_output(), resolved reference or None)` (`core/src/insn_rows.rs`). The
-facade turns a method's rows into objects when the method is first asked
-for, and keeps the last 256 methods' lists (`Analysis._LRU_SIZE`), so a
-method's instructions are the same objects across calls while it stays
-cached, as with androguard's per-method cache, and a walk over every method
-never holds more than that. Format fields are unpacked from the
-instruction's own bytes on first access, with the struct formats
-androguard's constructors use.
+get_output(), resolved reference or None)`.)
 
 ## androguard quirks reproduced
 
@@ -92,8 +101,8 @@ androguard's constructors use.
   every run anyway.
 - `ins.cm` and `get_raw_string()` need androguard's ClassManager: they
   raise `NotImplementedError`, counted in `androguard_rs.dex.GAPS`.
-- Notes added to a payload with `add_note()` last while its method stays
-  in the LRU.
+- A method whose code_item another method shares (crafted files) shares
+  its instruction objects (androguard makes a list per method).
 
 ## Parity and tests
 

@@ -7,14 +7,17 @@ trees are lxml elements, as in androguard).
 
 | androguard 4.1.3 | drop-in |
 |---|---|
-| `androguard.core.apk.APK(filename, raw=False, ...)` | `androguard_rs.apk.APK` |
-| `androguard.core.apk.FileNotPresent` / `BrokenAPKError` / `Error` | `androguard_rs.apk.FileNotPresent` / ... |
-| `androguard.core.axml.AXMLPrinter` / `format_value` | `androguard_rs.axml.AXMLPrinter` / `format_value` |
+| `androguard.core.apk.APK(filename, raw=False, ...)` | `androguard_rs.core.apk.APK` |
+| `androguard.core.apk.FileNotPresent` / `BrokenAPKError` / `Error` | `androguard_rs.core.apk.FileNotPresent` / ... |
+| `androguard.core.axml.AXMLPrinter` / `format_value` | `androguard_rs.core.axml.AXMLPrinter` / `format_value` |
 | `androguard.misc.AnalyzeAPK(_file, session=None, raw=False)` | `androguard_rs.misc.AnalyzeAPK` |
 | `androguard.util.set_log(level)` | `androguard_rs.util.set_log` (no-op) |
-| `androguard.core.api_specific_resources.load_permission_mappings(level)` | `androguard_rs.api_specific_resources.load_permission_mappings` (data vendored, Apache-2.0) |
+| `androguard.core.api_specific_resources.load_permission_mappings(level)` / `load_permissions(level)` | `androguard_rs.core.api_specific_resources.load_permission_mappings` / `load_permissions` (data vendored, Apache-2.0) |
+| `androguard.core.androconf.load_api_specific_resource_module(name, api)` | `androguard_rs.core.androconf.load_api_specific_resource_module` |
 
-Callers swap the import. `python/compat/androguard_compat.analyze_apk(path)`
+`androguard_rs.core.apk` is the module `androguard_rs.apk` (likewise
+`core.axml`/`axml`, `core.api_specific_resources`/`api_specific_resources`),
+so callers rename `androguard` to `androguard_rs` in the import. `python/compat/androguard_compat.analyze_apk(path)`
 now returns the native `APK` too (`native_apk=False` for androguard's), and
 `APK.get_androguard_apk()` builds androguard's own object when a caller
 needs something not covered here.
@@ -92,7 +95,9 @@ file! Wrong endian tag: ..." and lists it in `skipped_dex()`, for callers
 that load each DEX of `get_all_dex()` themselves and skip those two
 errors.
 
-Still androguard-only: `androguard.decompiler`.
+Not provided: the decompiler. `androguard_rs.decompiler` exists only for
+its import side effect (`sys.setrecursionlimit(5000)`, as
+`androguard.decompiler`'s import); see `docs/dex-api-map.md`.
 
 ## Differences from androguard 4.1.3
 
@@ -113,7 +118,8 @@ All checked by `python/tests/test_apk_parity.py` on real APKs
   differs between two androguard runs.
 - Exception types: parser failures are `androguard_rs.AxmlError`, zip and
   signing-block failures `androguard_rs.ApkError` (or `BrokenAPKError`
-  where androguard raises that), resources `ResourcesError`. Code that
+  where androguard raises that, and androguard's own `struct.error` for a
+  signing block cut short), resources `ResourcesError`. Code that
   catches `Exception` behaves the same.
 - Limits on hostile input, where androguard runs away: binary XML over
   64 MiB, more than 1024 open namespace mappings, or more than 256 MiB of

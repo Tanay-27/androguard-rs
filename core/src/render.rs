@@ -159,10 +159,30 @@ impl AgResolver<'_> {
         signed_string_index(idx, self.dex.string_count())
     }
 
+    /// `string(idx)` appended to `out`: the bytes as they are when
+    /// `mutf8_decode` would return them unchanged (its fast path), else the
+    /// decoded (or placeholder) text.
+    fn push_string(&self, out: &mut String, idx: u32) {
+        if let Ok(raw) = self.dex.string(idx)
+            && !raw.iter().any(|&b| b == 0xED || b == 0xC0 || b == 0x00)
+            && let Ok(utf8) = std::str::from_utf8(raw)
+        {
+            out.push_str(utf8);
+            return;
+        }
+        out.push_str(&self.string(idx));
+    }
+
     pub fn type_name(&self, idx: u32) -> String {
+        let mut out = String::new();
+        self.push_type(&mut out, idx);
+        out
+    }
+
+    fn push_type(&self, out: &mut String, idx: u32) {
         match self.dex.type_string_idx(idx) {
-            Some(s) => self.string(s),
-            None => "AG:ITI: invalid type".into(),
+            Some(s) => self.push_string(out, s),
+            None => out.push_str("AG:ITI: invalid type"),
         }
     }
 
@@ -170,7 +190,12 @@ impl AgResolver<'_> {
         let Ok((class_idx, proto_idx, name_idx)) = self.dex.method_id(idx) else {
             return "AG:IMI:invalid_class_name;->AG:IMI:invalid_name(AG:IMI:invalid_descriptor)".into();
         };
-        format!("{}->{}{}", self.type_name(class_idx), self.string(name_idx), self.proto(proto_idx))
+        let mut out = String::with_capacity(64);
+        self.push_type(&mut out, class_idx);
+        out.push_str("->");
+        self.push_string(&mut out, name_idx);
+        self.push_proto(&mut out, proto_idx, " ");
+        out
     }
 
     /// EncodedMethod's `get_name()` and `get_descriptor()` ("(P1 P2)R"),
@@ -192,28 +217,49 @@ impl AgResolver<'_> {
     }
 
     /// androguard's MethodIdItem.get_descriptor(): "(P1 P2)R", space-separated.
+    pub fn descriptor(&self, proto_idx: u32) -> String {
+        self.proto(proto_idx)
+    }
+
     fn proto(&self, proto_idx: u32) -> String {
         self.proto_with(proto_idx, " ")
     }
 
     fn proto_with(&self, proto_idx: u32, sep: &str) -> String {
+        let mut out = String::new();
+        self.push_proto(&mut out, proto_idx, sep);
+        out
+    }
+
+    /// "(P1<sep>P2)R" appended to `out`.
+    fn push_proto(&self, out: &mut String, proto_idx: u32, sep: &str) {
         match self.dex.proto(proto_idx) {
             Some((ret, params)) => {
-                let params: Vec<String> = params.into_iter().map(|t| self.type_name(t)).collect();
-                format!("({}){}", params.join(sep), self.type_name(ret))
+                out.push('(');
+                for (i, t) in params.into_iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(sep);
+                    }
+                    self.push_type(out, t);
+                }
+                out.push(')');
+                self.push_type(out, ret);
             }
-            None => "AG:IPI:invalid_params;(AG:IPI:invalid_return_type)".into(),
+            None => out.push_str("AG:IPI:invalid_params;(AG:IPI:invalid_return_type)"),
         }
     }
 
     pub fn field(&self, idx: u32) -> String {
         match self.dex.field_id(idx) {
-            Some((class_idx, type_idx, name_idx)) => format!(
-                "{}->{} {}",
-                self.type_name(class_idx),
-                self.string(name_idx),
-                self.type_name(type_idx)
-            ),
+            Some((class_idx, type_idx, name_idx)) => {
+                let mut out = String::with_capacity(64);
+                self.push_type(&mut out, class_idx);
+                out.push_str("->");
+                self.push_string(&mut out, name_idx);
+                out.push(' ');
+                self.push_type(&mut out, type_idx);
+                out
+            }
             None => "AG:IFI:invalid_class_name;->AG:IFI:invalid_name (AG:IFI:invalid_type)".into(),
         }
     }

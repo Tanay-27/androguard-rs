@@ -42,8 +42,8 @@ pub fn dex(dex: Dex) -> Result<()> {
 }
 
 /// The per-DEX object queries (`androguard_rs.dex.DEX`): class names, each
-/// class_def's header, each distinct class_data's members, the member
-/// lookups and the SSL pre-filter.
+/// class_def's header, each distinct class_data's members and the member
+/// lookups.
 pub fn dex_objects(dex: &Dex) {
     let _ = crate::dexview::class_names(dex);
     let mut seen = rustc_hash::FxHashSet::default();
@@ -57,7 +57,6 @@ pub fn dex_objects(dex: &Dex) {
     let _ = crate::dexview::field_names(dex);
     let _ = crate::dexview::find_member(dex, b"La;a()V", false);
     let _ = crate::dexview::find_member(dex, b"La;aI", true);
-    let _ = crate::dexview::ssl_candidates(dex);
 }
 
 /// Every query on a built index.

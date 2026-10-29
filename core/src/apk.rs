@@ -89,6 +89,11 @@ pub struct Loaded {
     pub skipped: Vec<SkippedDex>,
     /// Position in `names` of each of `dexes`.
     pub positions: Vec<usize>,
+    /// Under `HeaderMode::Record`: what androguard 4.1.3's `AnalyzeAPK`
+    /// raises for this APK (the first DEX, in load order, that `DEX()` or
+    /// `Analysis.add()` fails on, else what `create_xref()` raises), if
+    /// anything.
+    pub load_error: Option<crate::agload::AgErr>,
 }
 
 /// A DEX file left out of the index, and androguard's error for it.
@@ -102,6 +107,16 @@ pub struct SkippedDex {
     pub not_implemented: bool,
 }
 
+/// Python frames androguard may go deeper than `DEX.__init__` before
+/// RecursionError, when the caller doesn't say (the recursion limit, 1000,
+/// minus a typical call depth).
+pub const DEFAULT_MAX_DEPTH: i64 = 970;
+
+/// C recursion units left at androguard's `DEX.__init__` when the caller
+/// doesn't say (CPython 3.12's limit, measured at shallow depth).
+pub const DEFAULT_C_BUDGET: i64 = 6650;
+
+
 /// What to do with a DEX that androguard's `DEX()` header checks reject.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum HeaderMode {
@@ -110,7 +125,7 @@ pub enum HeaderMode {
     /// aren't made.
     Strict,
     /// As `Strict`, but leave out a DEX with "Header too small" or "Wrong
-    /// endian tag" (a tolerant load).
+    /// endian tag", as callers that skip a DEX `DEX()` rejects with those see it.
     Tolerant,
     /// Make every `HeaderItem` check androguard 4.1.3 makes, and leave out
     /// (recording the error) any DEX that fails one, so the caller can
@@ -121,7 +136,7 @@ pub enum HeaderMode {
 /// One of androguard 4.1.3's `HeaderItem` errors.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HeaderError {
-    /// "Header too small" or "Wrong endian tag": what a tolerant load skips.
+    /// "Header too small" or "Wrong endian tag": what `Tolerant` skips.
     pub skippable: bool,
     /// NotImplementedError (byte-swapped tag), else ValueError.
     pub not_implemented: bool,
@@ -129,7 +144,7 @@ pub struct HeaderError {
 }
 
 /// zlib.adler32
-fn adler32(b: &[u8]) -> u32 {
+pub(crate) fn adler32(b: &[u8]) -> u32 {
     let (mut a, mut s) = (1u32, 0u32);
     for chunk in b.chunks(5552) {
         for &c in chunk {
@@ -192,9 +207,9 @@ pub fn androguard_header_check(data: &[u8], full: bool) -> Option<HeaderError> {
 /// Every DEX of the APK at `apk`, in `get_all_dex()` order. With
 /// `tolerant`, a DEX androguard's `DEX()` rejects with "Not a DEX file,
 /// Header too small." or "This is not a DEX file! Wrong endian tag: ..."
-/// is left out instead of failing the APK. Any other error still fails it,
-/// and so do a missing entry (androguard's `FileNotPresent`) and the size
-/// caps.
+/// (a ValueError a caller looping over `get_all_dex()` can catch and skip) is
+/// left out instead of failing the APK. Any other error still fails it, and
+/// so do a missing entry (androguard's `FileNotPresent`) and the size caps.
 pub fn load_tolerant(apk: &str, tolerant: bool) -> Result<Loaded> {
     load_mode(apk, if tolerant { HeaderMode::Tolerant } else { HeaderMode::Strict })
 }
@@ -206,23 +221,35 @@ pub fn load_bytes_tolerant(apk: &[u8], tolerant: bool) -> Result<Loaded> {
 
 /// Every DEX of the APK at `apk`, header errors handled as `mode` says.
 pub fn load_mode(apk: &str, mode: HeaderMode) -> Result<Loaded> {
-    load_all(&ApkZip::open_path(apk)?, mode)
+    load_all(&ApkZip::open_path(apk)?, mode, (DEFAULT_MAX_DEPTH, DEFAULT_C_BUDGET))
+}
+
+/// `load_mode()`; under `HeaderMode::Record`, `max_depth` is how many
+/// Python frames androguard's `DEX()` may go deeper than its own frame and
+/// how many C recursion units are left there (`agload::load`).
+pub fn load_mode_depth(apk: &str, mode: HeaderMode, max_depth: (i64, i64)) -> Result<Loaded> {
+    load_all(&ApkZip::open_path(apk)?, mode, max_depth)
+}
+
+/// `load_mode_depth()` for an APK held in memory (not copied).
+pub fn load_bytes_mode_depth(apk: &[u8], mode: HeaderMode, max_depth: (i64, i64)) -> Result<Loaded> {
+    load_all(&ApkZip::open(Box::new(MemSource(apk)))?, mode, max_depth)
 }
 
 /// `load_mode()` for an APK held in memory (not copied).
 pub fn load_bytes_mode(apk: &[u8], mode: HeaderMode) -> Result<Loaded> {
-    load_all(&ApkZip::open(Box::new(MemSource(apk)))?, mode)
+    load_all(&ApkZip::open(Box::new(MemSource(apk)))?, mode, (DEFAULT_MAX_DEPTH, DEFAULT_C_BUDGET))
 }
 
-fn load_all(zip: &ApkZip<'_>, mode: HeaderMode) -> Result<Loaded> {
+fn load_all(zip: &ApkZip<'_>, mode: HeaderMode, max_depth: (i64, i64)) -> Result<Loaded> {
     let names = dex_names(zip);
-    let (dexes, skipped, positions) = load_zip_mode(zip, &names, mode)?;
-    Ok(Loaded { names, dexes, skipped, positions })
+    let (dexes, skipped, positions, load_error) = load_zip_inner(zip, &names, mode, max_depth)?;
+    Ok(Loaded { names, dexes, skipped, positions, load_error })
 }
 
 /// androguard's first two `DEX()` header checks (`HeaderItem`): the error
 /// message, or `None` if they pass. The byte-swapped tag is androguard's
-/// `NotImplementedError`, which a tolerant load doesn't skip.
+/// `NotImplementedError`, not the ValueError `Tolerant` skips.
 pub fn androguard_header_error(data: &[u8]) -> Option<(bool, String)> {
     androguard_header_check(data, false).map(|e| (e.skippable, e.message))
 }
@@ -246,8 +273,17 @@ pub fn load_zip_mode(
     entries: &[String],
     mode: HeaderMode,
 ) -> Result<(Vec<Dex>, Vec<SkippedDex>, Vec<usize>)> {
+    load_zip_inner(zip, entries, mode, (DEFAULT_MAX_DEPTH, DEFAULT_C_BUDGET)).map(|(d, s, p, _)| (d, s, p))
+}
+
+type Inner = (Vec<Dex>, Vec<SkippedDex>, Vec<usize>, Option<crate::agload::AgErr>);
+
+fn load_zip_inner(zip: &ApkZip<'_>, entries: &[String], mode: HeaderMode, max_depth: (i64, i64)) -> Result<Inner> {
+    use crate::agload::{self, AgErr};
     let used = AtomicU64::new(0);
-    let loaded: Vec<std::result::Result<Dex, SkippedDex>> = entries
+    // Ok(Ok((dex, add error, create_xref error))) or Ok(Err((left out, its DEX() error))).
+    type One = std::result::Result<(Dex, Option<AgErr>, Option<AgErr>), (SkippedDex, Option<AgErr>)>;
+    let loaded: Vec<One> = entries
         .par_iter()
         .enumerate()
         .map(|(pos, name)| {
@@ -261,28 +297,67 @@ pub fn load_zip_mode(
             if total > MAX_TOTAL_DEX_BYTES {
                 bail!("DEX files total over the {MAX_TOTAL_DEX_BYTES}-byte limit");
             }
-            if let Some(e) = androguard_header_check(&buf, mode == HeaderMode::Record) {
-                if mode == HeaderMode::Record || (mode == HeaderMode::Tolerant && e.skippable) {
-                    return Ok(Err(SkippedDex { name: name.clone(), message: e.message, pos, not_implemented: e.not_implemented }));
+            if mode == HeaderMode::Record {
+                // Every check androguard's DEX() makes, then Analysis.add()'s
+                // and create_xref()'s.
+                let st = match agload::load(&buf, max_depth.0, max_depth.1) {
+                    Ok(st) => st,
+                    Err(e) => {
+                        let (message, not_implemented) = match &e {
+                            AgErr::Header { message, not_implemented } => (message.clone(), *not_implemented),
+                            other => (format!("{other:?}"), false),
+                        };
+                        return Ok(Err((SkippedDex { name: name.clone(), message, pos, not_implemented }, Some(e))));
+                    }
+                };
+                if st.no_map {
+                    // Analysis.add() fails on it; nothing to index.
+                    let e = agload::add_error_no_map();
+                    let s = SkippedDex { name: name.clone(), message: format!("{e:?}"), pos, not_implemented: false };
+                    return Ok(Err((s, Some(e))));
+                }
+                let dex = Dex::parse(buf).with_context(|| format!("parsing {name}"))?;
+                let add = agload::add_error(&st, &dex);
+                let xref = if add.is_none() { agload::xref_error(&st, &dex) } else { None };
+                return Ok(Ok((dex, add, xref)));
+            }
+            if let Some(e) = androguard_header_check(&buf, false) {
+                if mode == HeaderMode::Tolerant && e.skippable {
+                    return Ok(Err((SkippedDex { name: name.clone(), message: e.message, pos, not_implemented: e.not_implemented }, None)));
                 }
                 bail!("parsing {name}: {}", e.message);
             }
-            Ok(Ok(Dex::parse(buf).with_context(|| format!("parsing {name}"))?))
+            Ok(Ok((Dex::parse(buf).with_context(|| format!("parsing {name}"))?, None, None)))
         })
         .collect::<Result<_>>()?;
     let mut dexes = Vec::new();
     let mut skipped = Vec::new();
     let mut positions = Vec::new();
+    // androguard: DEX() then add() for each file in turn, create_xref() at
+    // the end.
+    let mut first: Option<AgErr> = None;
+    let mut xref: Option<AgErr> = None;
     for (pos, r) in loaded.into_iter().enumerate() {
         match r {
-            Ok(d) => {
+            Ok((d, add, x)) => {
                 dexes.push(d);
                 positions.push(pos);
+                if first.is_none() {
+                    first = add;
+                }
+                if xref.is_none() {
+                    xref = x;
+                }
             }
-            Err(s) => skipped.push(s),
+            Err((s, e)) => {
+                if first.is_none() {
+                    first = e;
+                }
+                skipped.push(s);
+            }
         }
     }
-    Ok((dexes, skipped, positions))
+    Ok((dexes, skipped, positions, first.or(xref)))
 }
 
 #[cfg(test)]

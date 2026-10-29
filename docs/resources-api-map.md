@@ -31,7 +31,7 @@ raised from every call, and `None` means the APK has no `resources.arsc`.
 | `get_packages_names()` | identical |
 | `get_public_resources(package_name, locale="\x00\x00")` | byte-identical XML: every entry of every config of that locale, duplicates included; a package missing from the table gives an empty `<resources>`; names aren't escaped |
 | `get_resolved_strings()` | `{package: {locale or "DEFAULT": {rid: str or None}}}`: equal dicts, same key order at every level |
-| `get_resolved_res_configs(rid)` | the same values, nesting and order, references followed; the config comes back as `ARSCResTableConfig._get_tuple()` (a 9-tuple) instead of the object; `rid == 0` raises `ValueError`, as androguard does |
+| `get_resolved_res_configs(rid)` | the same values, nesting and order, references followed; `Resources` gives the config as `ARSCResTableConfig._get_tuple()` (a 9-tuple), while `androguard_rs.apk.ARSCParser` (`APK.get_android_resources()`, `androguard_rs.axml.ARSCParser`) and the facade's `ARSCParser` give androguard's `ARSCResTableConfig` objects (androguard 4.1.3's class, built from the bytes androguard reads: one per type chunk, the first chunk's object for equal configs; every attribute, `repr()`, `==`, `hash()` and method equal, `python/tests/test_arsc_configs.py`); a `config=` filter is not implemented (`NotImplementedError`); `rid == 0` raises `ValueError`, as androguard does |
 | `get_resource_xml_name(rid, package=None)` | `"@package:type/name"` from the first package whose default-locale public list has `rid`, else `None` (also `None` for a match in a package with an empty name); O(1), where androguard scans linearly |
 
 ## androguard behaviour preserved, quirks included

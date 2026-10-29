@@ -33,12 +33,16 @@ Notes:
   | `test_standalone`, `test_compat` | every native query and every Analysis-object attribute on `fixture_apk.py`'s two-DEX APK | `scripts/gen_fixture_goldens.py` |
   | `test_dup_classes` | classes defined more than once, on `dup_cases.py`'s APKs | `scripts/gen_dup_goldens.py` |
   | `test_arsc_zip` | `Resources.from_apk()` on tampered zips | `scripts/gen_arsc_zip_goldens.py` |
-  | `test_strict` | load errors: `AnalyzeAPK` and a hand-written `DEX()`/`Analysis.add()` loop on `strict_cases.py` | `scripts/gen_dexobj_goldens.py` |
+  | `test_strict` | load errors (`DEX()` header, map list and sections, `Analysis.add()`, `create_xref()`): `AnalyzeAPK` and a hand-written `DEX()`/`Analysis.add()` loop on `strict_cases.py` | `scripts/gen_dexobj_goldens.py` |
   | `test_sig` | signed const-string/jumbo indices, `->` in class names, on `sig_cases.py` | `scripts/gen_dexobj_goldens.py` |
-  | `test_dexobj` | the per-DEX and analysis objects (`ClassDefItem`, `EncodedMethod`, `EncodedField`, `find_methods`, xrefs, `repr()`s) and `get_ssl_candidate_methods()` on `dexobj_cases.py` | `scripts/gen_dexobj_goldens.py` |
+  | `test_dexobj` | the per-DEX and analysis objects (`ClassDefItem`, `EncodedMethod`, `EncodedField`, `find_methods`, xrefs, `repr()`s), and a per-method instruction walk, on `dexobj_cases.py` | `scripts/gen_dexobj_goldens.py` |
+  | `test_arsc_configs` | `ARSCParser.get_resolved_res_configs()`'s `ARSCResTableConfig` objects (type, `vars()`, `repr()`, `hash()`, methods) on `arsc_config_cases.py`'s tables | `scripts/gen_arsc_config_goldens.py` |
+  | `test_handles` | per-query handles: every route to a method, field, class, code item or instruction gives equal, hash-equal objects; nothing kept on the Python side; on `fixture_apk.py`'s APK | (self-contained) |
+  | `test_layout` | androguard 4.1.3's module paths under `androguard_rs`, the same modules as the short paths; `core.androconf` against androguard's when installed | (self-contained) |
 
   With androguard installed, the `*_parity` modules also check those cases
-  live against it. Without androguard, `python/tests/conftest.py` skips the
+  live against it (`test_strict_parity` also finds the nesting at which
+  `RecursionError` comes, for several caller stack depths). Without androguard, `python/tests/conftest.py` skips the
   modules that import it and the goldens-based tests still run. The
   real-APK tests in `test_parity`, `test_compat_parity`, `test_apk_parity`,
   `test_dex_order_parity`, `test_model`, `test_invalid`, `test_insn_parity`,
@@ -119,9 +123,9 @@ and mutf8 versions output parity is defined against, and check it against
 `SHA256SUMS`:
 
 ```sh
-gh release download v0.1.1 --repo Tanay-27/androguard-rs --pattern '*.whl' --pattern SHA256SUMS
+gh release download v0.1.2 --repo Tanay-27/androguard-rs --pattern '*.whl' --pattern SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
-pip install ./androguard_rs-0.1.1-*.whl
+pip install ./androguard_rs-0.1.2-*.whl
 python -c "import androguard_rs; print(androguard_rs.__file__)"
 ```
 

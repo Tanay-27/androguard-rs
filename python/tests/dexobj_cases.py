@@ -13,8 +13,9 @@ sinks, Math.random and Random.<init> calls, registerReceiver calls, static
 fields with typed initial values, a <clinit> that sput-objects one, a class
 defined in both DEX files and two class_defs sharing a class_data.
 
-`views(d, dx)` is what the tests compare; `tls_candidates()` is a reference
-definition of the get_ssl_candidate_methods() extension.
+`views(d, dx)` is what the tests compare; `tls_candidates()` is a
+per-method walk over every DEX object's get_encoded_methods() and
+get_instructions(), as a caller scanning for TLS-related code makes it.
 """
 
 import re
@@ -283,14 +284,12 @@ def views(d, dx):
     return out
 
 
-# ── reference for DEX.get_ssl_candidate_methods() ─────────────────────────
+# ── a per-method walk: TLS-related methods ───────────────────────────────
 #
-# get_ssl_candidate_methods() is an androguard_rs extension: the
-# EncodedMethods of get_encoded_methods(), in that order, that could
-# implement or weaken TLS certificate/hostname checks. This is an
-# independent, slow definition of the same set over any androguard-shaped
-# DEX object, so the native pre-filter can be checked against androguard's
-# own objects.
+# The EncodedMethods of get_encoded_methods(), in that order, that could
+# implement or weaken TLS certificate/hostname checks, selected by name and
+# by each instruction's get_name()/get_output(): a whole walk over the
+# per-DEX objects, compared between androguard and androguard_rs.
 
 TLS_METHOD_NAMES = frozenset({"checkServerTrusted", "verify", "onReceivedSslError"})
 # (instruction name, how its get_output() must contain the marker, marker)
@@ -317,10 +316,6 @@ def is_tls_candidate(em) -> bool:
 def tls_candidates(vms) -> list:
     """Per DEX object, str() of every method is_tls_candidate() selects."""
     return [[str(em) for em in vm.get_encoded_methods() if is_tls_candidate(em)] for vm in vms]
-
-
-def native_tls_candidates(vms) -> list:
-    return [[str(em) for em in vm.get_ssl_candidate_methods()] for vm in vms]
 
 
 # ── the same on real APKs (PARITY_APKS), without per-instruction detail ──────

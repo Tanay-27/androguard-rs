@@ -3,8 +3,8 @@ androguard: per-DEX objects (DEX.get_classes/get_class/get_encoded_methods/
 get_encoded_method_descriptor/get_encoded_field_descriptor/get_encoded_field,
 ClassDefItem, EncodedMethod incl. get_information() and str(),
 EncodedField.get_init_value().get_value()), Analysis.find_methods(),
-MethodAnalysis.method/repr()/get_xref_from(), get_vm_class(), and the
-get_ssl_candidate_methods() extension, from AnalyzeAPK and from a manual
+MethodAnalysis.method/repr()/get_xref_from(), get_vm_class(), and a
+per-method instruction walk, from AnalyzeAPK and from a manual
 DEX()/Analysis.add() load. Goldens (dexobj_goldens.py) were generated from
 androguard 4.1.3 + mutf8 1.1.0 by scripts/gen_dexobj_goldens.py;
 test_dexobj_parity.py checks live.
@@ -61,16 +61,6 @@ def test_facade(raw, tmp_path):
     p = tmp_path / "a.apk"
     p.write_bytes(raw)
     _check(K.views(*compat.analyze_apk(str(p))[1:]))
-
-
-def test_ssl_prefilter(raw):
-    """get_ssl_candidate_methods() selects what the reference definition
-    selects, in get_encoded_methods() order, and is a small subset."""
-    d, _ = manual(raw)
-    assert K.native_tls_candidates(d) == GOLDEN["tls_candidates"]
-    n_all = sum(len(vm.get_encoded_methods()) for vm in d)
-    n_cand = sum(len(vm.get_ssl_candidate_methods()) for vm in d)
-    assert 0 < n_cand < n_all / 2
 
 
 def test_identity(raw):

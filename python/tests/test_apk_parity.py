@@ -40,10 +40,11 @@ if APKS:
 
 
 def outcome(f, *args):
+    """("ok", value) or ("raises", exception type name, str())."""
     try:
         return ("ok", f(*args))
-    except Exception:
-        return ("raises",)
+    except Exception as e:  # noqa: BLE001
+        return ("raises", type(e).__name__, str(e))
 
 
 def printer_outcome(cls, raw):

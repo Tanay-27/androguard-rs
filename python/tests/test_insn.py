@@ -90,8 +90,8 @@ def test_get_bc_and_dcode(methods):
     bc = em.get_code().get_bc()
     insns = list(bc.get_instructions())
     assert [type(i).__name__ for i in insns[:3]] == ["Instruction10x", "PackedSwitch", "PackedSwitch"]
-    assert bc.get_instruction(1) is insns[1] is em.get_code().get_instruction(1)
-    assert bc.get_ins_off(2) is insns[1] and bc.get_ins_off(3) is None
+    assert bc.get_instruction(1) == insns[1] == em.get_code().get_instruction(1)
+    assert bc.get_ins_off(2) == insns[1] and bc.get_ins_off(3) is None
     assert bc.off_to_pos(2) == 1 and bc.off_to_pos(3) == -1
     assert bytes(bc.get_raw()) == b"".join(i.get_raw() for i in insns)
     assert bc.get_length() == len(bc.get_raw())
@@ -129,19 +129,29 @@ def test_unsupported_is_loud(methods):
     assert not hasattr(ins, "no_such_attribute")
 
 
-def test_lru_is_bounded(path):
-    class Small(compat.Analysis):
-        _LRU_SIZE = 2
-
-    dx = Small(androguard_rs.Apk(path))
+def test_instructions_are_handles(path):
+    # Each query makes new instruction handles (androguard keeps one list
+    # per method): asking again, after other methods, gives equal objects
+    # with equal hashes, whether through the facade or the DEX objects, but
+    # not the same objects; a payload's notes stay on the object they were
+    # added to.
+    dx = compat.Analysis(androguard_rs.Apk(path))
     ems = {ma.name: ma.get_method() for ma in dx.get_class_analysis(insn_apk.OPS).get_methods()}
     first = list(ems["allops"].get_instructions())
-    assert list(ems["allops"].get_instructions())[0] is first[0]  # cached: the same objects
     for name in ("variants", "refs", "payloads"):
         list(ems[name].get_instructions())
-    assert len(dx._lru) == 2
-    again = list(ems["allops"].get_instructions())  # evicted: decoded again
-    assert again[0] is not first[0] and [insn_shape(i) for i in again] == [insn_shape(i) for i in first]
+    again = list(ems["allops"].get_instructions())
+    assert len(again) == len(first) and all(a == b and hash(a) == hash(b) for a, b in zip(again, first))
+    assert not any(a is b for a, b in zip(again, first))
+    assert len(set(first) | set(again)) == len(first)
+    assert all(a != b for a, b in zip(first, first[1:]))
+    dexm = ems["allops"]._dex_method()
+    assert list(dexm.get_instructions()) == first
+    assert dexm.get_code() == dexm.get_code() and dexm.get_code().get_bc() == dexm.get_code().get_bc()
+    assert hash(dexm.get_code()) == hash(dexm.get_code())
+    payload = list(ems["payloads"].get_instructions())[1]
+    payload.add_note("x")
+    assert payload.get_notes() == ["x"] and list(ems["payloads"].get_instructions())[1].get_notes() == []
 
 
 def test_no_androguard_needed(path):

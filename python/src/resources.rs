@@ -1,6 +1,7 @@
 //! `androguard_rs.Resources`: androguard's `ARSCParser` query methods,
 //! byte-identical to androguard 4.1.3, on a table parsed once in Rust.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use pyo3::create_exception;
@@ -96,9 +97,12 @@ impl Resources {
     }
 
     /// `get_resolved_res_configs(rid)`: [(config, value)], value a str, or a
-    /// list for a complex entry. The config is `ARSCResTableConfig._get_tuple()`
-    /// rather than the config object.
-    fn get_resolved_res_configs<'py>(&self, py: Python<'py>, rid: i64) -> PyResult<Bound<'py, PyList>> {
+    /// list for a complex entry. The config is `ARSCResTableConfig._get_tuple()`,
+    /// or, with `factory`, `factory(start, raw)` for the bytes androguard's
+    /// `ARSCResTableConfig(buff)` read at `start` (one call per config
+    /// object; the same object is reused).
+    #[pyo3(signature = (rid, factory = None))]
+    fn get_resolved_res_configs<'py>(&self, py: Python<'py>, rid: i64, factory: Option<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyList>> {
         self.analysed()?;
         if rid == 0 {
             return Err(PyValueError::new_err("'rid' should be set"));
@@ -107,7 +111,7 @@ impl Resources {
             return Ok(PyList::empty(py));
         }
         let r = py.detach(|| self.arsc.resolved_res_configs(rid as u32)).map_err(err)?;
-        let mut cv = Conv { py, r: &r, strings: vec![None; r.strings.len()], configs: vec![None; r.configs.len()] };
+        let mut cv = Conv { py, r: &r, strings: vec![None; r.strings.len()], configs: HashMap::new(), factory };
         let out = PyList::empty(py);
         for it in &r.items {
             out.append(cv.item(it)?)?;
@@ -157,7 +161,9 @@ struct Conv<'py, 'a> {
     py: Python<'py>,
     r: &'a Resolved<'a>,
     strings: Vec<Option<Bound<'py, PyString>>>,
-    configs: Vec<Option<Bound<'py, PyTuple>>>,
+    configs: HashMap<u32, Bound<'py, PyAny>>,
+    /// Builds a config object from (start, bytes); None: `_get_tuple()`s.
+    factory: Option<Bound<'py, PyAny>>,
 }
 
 impl<'py> Conv<'py, '_> {
@@ -165,11 +171,19 @@ impl<'py> Conv<'py, '_> {
         self.strings[i as usize].get_or_insert_with(|| PyString::new(self.py, &self.r.strings[i as usize])).clone()
     }
 
-    fn config(&mut self, i: u32) -> PyResult<Bound<'py, PyTuple>> {
-        if self.configs[i as usize].is_none() {
-            self.configs[i as usize] = Some(PyTuple::new(self.py, self.r.configs[i as usize])?);
+    fn config(&mut self, c: u32) -> PyResult<Bound<'py, PyAny>> {
+        if let Some(o) = self.configs.get(&c) {
+            return Ok(o.clone());
         }
-        Ok(self.configs[i as usize].clone().unwrap())
+        let o = match &self.factory {
+            Some(f) => {
+                let (start, raw) = self.r.config_bytes(c);
+                f.call1((start, PyBytes::new(self.py, raw)))?
+            }
+            None => PyTuple::new(self.py, self.r.config_key(c))?.into_any(),
+        };
+        self.configs.insert(c, o.clone());
+        Ok(o)
     }
 
     fn item(&mut self, it: &Item) -> PyResult<Bound<'py, PyAny>> {

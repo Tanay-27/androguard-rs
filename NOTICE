@@ -6,9 +6,11 @@ This product is licensed under the Apache License, Version 2.0 (see LICENSE).
 It reimplements, in Rust and Python, behaviour of androguard 4.1.3
 (https://github.com/androguard/androguard), Copyright the androguard
 authors, licensed under the Apache License, Version 2.0. It includes data
-copied from androguard 4.1.3 (API permission mappings, the system attribute
-table derived from AOSP's public.xml) and Python code ported from
-androguard 4.1.3 (androguard_rs/apk.py, axml.py, misc.py); see
+copied from androguard 4.1.3 (API permission mappings, AOSP permission
+lists, the system attribute table derived from AOSP's public.xml) and
+Python code ported or copied from androguard 4.1.3 (androguard_rs/apk.py,
+axml.py, misc.py, dex.py, _arscconfig.py, _agerr.py,
+api_specific_resources/__init__.py, core/androconf.py); see
 python/licenses/androguard-VENDORED.md.
 
 It includes a modified copy of dex-bytecode

@@ -19,6 +19,9 @@ pub struct Dex {
     pub(crate) declared: crate::maplist::Declared,
     /// class_info results shared between class_defs (see classes.rs).
     pub(crate) memo: crate::classes::Memo,
+    /// Every string_id points at a declared string_data_item (the usual
+    /// case), so `string()` needn't look each one up.
+    strings_declared: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -63,6 +66,12 @@ pub struct ClassData {
     pub virtual_methods: Vec<Member>,
 }
 
+/// Whether androguard's mutf8 decodes `raw` (ASCII always does).
+#[inline]
+fn mutf8_ok(raw: &[u8]) -> bool {
+    raw.iter().all(|&c| c < 0x80) || crate::render::mutf8_decode(raw).is_some()
+}
+
 #[inline]
 pub fn slice(b: &[u8], off: usize, len: usize) -> Result<&[u8]> {
     off.checked_add(len)
@@ -104,24 +113,39 @@ impl Dex {
         if &magic[..2] != b"de" || !matches!(magic[2], b'x' | b'y') || magic[3] != b'\n' {
             bail!("not a DEX file");
         }
-        let table = |size_at: usize, entry: usize| -> Result<Table> {
-            let size = u32_at(&data, size_at)? as usize;
-            let off = u32_at(&data, size_at + 4)? as usize;
-            // Validate the whole table up front so per-entry reads can't run off the end.
-            slice(&data, off, size.checked_mul(entry).ok_or_else(|| anyhow!("table size overflow"))?)?;
-            Ok(Table { off, size })
+        let declared = crate::maplist::Declared::parse(&data);
+        // androguard reads the id tables from the map list's sections, not
+        // from the header; without a map list (androguard then has none)
+        // the header's are used.
+        let tables = match declared.tables {
+            Some(t) => t.map(|(off, size)| Table { off, size }),
+            None => {
+                let table = |size_at: usize, entry: usize| -> Result<Table> {
+                    let size = u32_at(&data, size_at)? as usize;
+                    let off = u32_at(&data, size_at + 4)? as usize;
+                    // Validate the whole table up front so per-entry reads can't run off the end.
+                    slice(&data, off, size.checked_mul(entry).ok_or_else(|| anyhow!("table size overflow"))?)?;
+                    Ok(Table { off, size })
+                };
+                [table(56, 4)?, table(64, 4)?, table(72, 12)?, table(80, 8)?, table(88, 8)?, table(96, 32)?]
+            }
         };
+        let [string_ids, type_ids, proto_ids, field_ids, method_ids, class_defs] = tables;
         let mut dex = Dex {
-            string_ids: table(56, 4)?,
-            type_ids: table(64, 4)?,
-            proto_ids: table(72, 12)?,
-            field_ids: table(80, 8)?,
-            method_ids: table(88, 8)?,
-            class_defs: table(96, 32)?,
-            declared: crate::maplist::Declared::parse(&data),
+            string_ids,
+            type_ids,
+            proto_ids,
+            field_ids,
+            method_ids,
+            class_defs,
+            declared,
             memo: Default::default(),
+            strings_declared: false,
             data,
         };
+        dex.strings_declared = (0..dex.string_ids.size).all(|i| {
+            u32_at(&dex.data, dex.string_ids.off + 4 * i).is_ok_and(|o| dex.has_string_data(o))
+        });
         dex.memo = crate::classes::Memo::build(&dex);
         Ok(dex)
     }
@@ -159,8 +183,12 @@ impl Dex {
         if idx as usize >= self.string_ids.size {
             bail!("string idx {idx} out of range");
         }
-        let mut pos = u32_at(&self.data, self.string_ids.off + 4 * idx as usize)? as usize;
-        uleb128(&self.data, &mut pos)?; // utf16 length, unused
+        let off = u32_at(&self.data, self.string_ids.off + 4 * idx as usize)?;
+        if !self.strings_declared && !self.has_string_data(off) {
+            bail!("string data at {off:#x} is not declared in the map list");
+        }
+        let mut pos = off as usize;
+        crate::maplist::ag_uleb128(&self.data, &mut pos)?; // utf16 length, unused
         let rest = self.data.get(pos..).ok_or_else(|| anyhow!("string data out of bounds"))?;
         let len = memchr::memchr(0, rest).ok_or_else(|| anyhow!("unterminated string"))?;
         Ok(&rest[..len])
@@ -194,8 +222,36 @@ impl Dex {
         // androguard keys array-receiver calls (e.g. [Lfoo;->clone) on the
         // element class name with the '[' stripped; match its identity.
         let cls = self.type_desc(class_idx)?;
+        if !mutf8_ok(cls) {
+            // androguard's "ANDROGUARD[INVALID_STRING] ..." isn't a class
+            // name create_xref() follows (it wants an 'L').
+            bail!("class name of method {idx} is not MUTF-8");
+        }
         f(&cls[cls.iter().take_while(|&&c| c == b'[').count()..]);
         self.tail_parts(proto_idx, name_idx, f)
+    }
+
+    /// androguard's text for string `idx` as `get_string()` gives it, fed
+    /// to `f` as bytes: the MUTF-8 bytes themselves when they decode,
+    /// "ANDROGUARD[INVALID_STRING] b'...'" when they don't, "AG:IS: invalid
+    /// string" for an index out of range or undeclared data.
+    fn ag_string_part(&self, idx: u32, f: &mut dyn FnMut(&[u8])) {
+        match self.string(idx) {
+            Ok(raw) if mutf8_ok(raw) => f(raw),
+            Ok(raw) => f(format!("ANDROGUARD[INVALID_STRING] {}", crate::render::py_bytes_repr(raw)).as_bytes()),
+            Err(_) => f(b"AG:IS: invalid string"),
+        }
+    }
+
+    /// androguard's `get_type(idx)` text, as `ag_string_part`.
+    fn ag_type_part(&self, idx: u32, f: &mut dyn FnMut(&[u8])) {
+        if idx as usize >= self.type_ids.size {
+            return f(b"AG:ITI: invalid type");
+        }
+        match u32_at(&self.data, self.type_ids.off + 4 * idx as usize) {
+            Ok(s) => self.ag_string_part(s, f),
+            Err(_) => f(b"AG:ITI: invalid type"),
+        }
     }
 
     /// The part of `method_sig_parts` after the class: `->name(params)ret`.
@@ -204,20 +260,23 @@ impl Dex {
         self.tail_parts(proto_idx, name_idx, f)
     }
 
+    /// `->name(params)ret` as androguard's MethodIdItem names it: a name or
+    /// type it can't resolve is its placeholder text (`ag_string_part`).
     fn tail_parts(&self, proto_idx: u32, name_idx: u32, f: &mut dyn FnMut(&[u8])) -> Result<()> {
-        f(b"->");
-        f(self.string(name_idx)?);
-        f(b"(");
         if proto_idx as usize >= self.proto_ids.size {
             bail!("proto idx {proto_idx} out of range");
         }
         let po = self.proto_ids.off + 12 * proto_idx as usize;
         let ret_idx = u32_at(&self.data, po + 4)?;
-        for t in self.type_list(u32_at(&self.data, po + 8)?)? {
-            f(self.type_desc(t)?);
+        let params = self.type_list(u32_at(&self.data, po + 8)?)?;
+        f(b"->");
+        self.ag_string_part(name_idx, f);
+        f(b"(");
+        for t in params {
+            self.ag_type_part(t, f);
         }
         f(b")");
-        f(self.type_desc(ret_idx)?);
+        self.ag_type_part(ret_idx, f);
         Ok(())
     }
 
@@ -352,8 +411,13 @@ impl Dex {
         if !self.has_code_item(code_off) {
             bail!("no code_item declared at {code_off:#x}");
         }
+        // androguard reads what is there of insns running past the end of
+        // the file (a lone last byte makes its sweep fail; it is left out).
         let o = code_off as usize;
         let insns_units = u32_at(&self.data, o + 12)? as usize;
-        slice(&self.data, o + 16, insns_units.checked_mul(2).ok_or_else(|| anyhow!("insns overflow"))?)
+        let start = o + 16;
+        let end = start.saturating_add(insns_units.saturating_mul(2)).min(self.data.len());
+        let len = end.saturating_sub(start) & !1;
+        slice(&self.data, start, len)
     }
 }

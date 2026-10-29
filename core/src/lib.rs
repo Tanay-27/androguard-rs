@@ -1,6 +1,7 @@
 //! androguard-core: androguard 4.1.3's APK, DEX, analysis and resources
 //! queries, without androguard's memory cost. Output text is byte-identical to androguard 4.1.3.
 
+pub mod agload;
 pub mod apk;
 pub mod arsc;
 pub mod axml;

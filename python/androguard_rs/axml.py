@@ -25,8 +25,9 @@ from typing import Union
 from lxml import etree
 
 from . import _native
+from ._arscconfig import ARSCResTableConfig  # noqa: F401
 
-__all__ = ["AXMLPrinter", "AXMLParser", "format_value", "AxmlError", "START_TAG", "END_TAG", "TEXT", "END_DOCUMENT"]
+__all__ = ["ARSCResTableConfig", "AXMLPrinter", "AXMLParser", "format_value", "AxmlError", "START_TAG", "END_TAG", "TEXT", "END_DOCUMENT"]
 
 AxmlError = _native.AxmlError
 
@@ -331,8 +332,8 @@ class AXMLPrinter:
 
 
 def __getattr__(name):
-    # androguard 4.1.3 has ARSCParser in androguard.core.axml (callers import
-    # it from there); here it lives in .apk, which imports this module.
+    # androguard 4.1.3 has ARSCParser in androguard.core.axml; here it lives in
+    # .apk, which imports this module.
     if name == "ARSCParser":
         from .apk import ARSCParser
 

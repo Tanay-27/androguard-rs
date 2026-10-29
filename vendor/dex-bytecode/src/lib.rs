@@ -19,7 +19,7 @@ pub use control_flow::{
     TryCatchEntry,
 };
 pub use decoder::{
-    decode_all, decode_all_with_resolver, decode_one, decode_one_with_resolver, Decoder,
+    decode_all, decode_all_with_resolver, decode_length, decode_one, decode_one_with_resolver, Decoder,
 };
 pub use error::DexError;
 pub use instruction::{Instruction, RefKind};

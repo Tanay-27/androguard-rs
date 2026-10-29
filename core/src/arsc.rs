@@ -378,6 +378,8 @@ struct TypeChunk {
     ctx: u32,
     type_id: u8,
     config: u32,
+    /// Where its `ARSCResTableConfig` was read: [start, end) in the table.
+    config_span: (u32, u32),
     entries: Range<u32>,
 }
 
@@ -390,8 +392,9 @@ struct LocaleValues {
     strings: Vec<(u32, u32)>,
 }
 
-/// `resource_values`: per rid, (config, chunk, entry) in first-seen config
-/// order, a later entry for the same config replacing the earlier one.
+/// `resource_values`: per rid, (chunk whose config object is the key,
+/// chunk, entry) in first-seen config order, a later entry for the same
+/// config replacing the earlier one.
 struct ResourceValues {
     /// Sorted by rid, then config order within it.
     items: Vec<(u32, u32, u32, u32)>,
@@ -593,7 +596,9 @@ impl Arsc {
         let entry_count = cur.u32()?;
         let entries_start = cur.u32()?;
         *res_id = (*res_id & 0xFF00_0000) | (type_id as u32) << 16;
+        let config_start = cur.pos as u32;
         let config = self.intern_config(read_config(cur)?);
+        let config_span = (config_start, cur.pos as u32);
         // androguard logs repr(self), eagerly formatted, which decodes the
         // type's name: a bad one fails the parse.
         self.pools[self.ctxs[ctx as usize].types as usize].locate(cur.b, type_id as i64 - 1)?;
@@ -605,7 +610,7 @@ impl Arsc {
             let ate = self.parse_entry(cur, base + off as u64, chunk_end, complex_at)?;
             self.entries.push(Entry { rid, ate });
         }
-        self.chunks.push(TypeChunk { ctx, type_id, config, entries: first..self.entries.len() as u32 });
+        self.chunks.push(TypeChunk { ctx, type_id, config, config_span, entries: first..self.entries.len() as u32 });
         Ok(self.chunks.len() as u32 - 1)
     }
 
@@ -726,10 +731,12 @@ impl Arsc {
                     let ate = self.entries[e as usize].ate;
                     let rid = self.entries[e as usize].rid;
                     match slot.get(&(rid, chunk.config)) {
-                        Some(&i) => rv[i] = (rid, chunk.config, c, e),
+                        // A dict keeps the key it was first given: the config
+                        // object of the first chunk, with the latest entry.
+                        Some(&i) => rv[i] = (rid, rv[i].1, c, e),
                         None => {
                             slot.insert((rid, chunk.config), rv.len());
-                            rv.push((rid, chunk.config, c, e));
+                            rv.push((rid, c, c, e));
                         }
                     }
                     // resource_keys[pkg][get_type()][get_value()] = rid
@@ -923,7 +930,7 @@ impl Arsc {
         let mut r = Resolver { arsc: self, d: Decoder::new(self), steps: 0, stack: Vec::new() };
         let mut out = Vec::new();
         r.resolve_into(&mut out, rid)?;
-        Ok(Resolved { items: out, configs: &self.configs, strings: r.d.into_strings() })
+        Ok(Resolved { items: out, arsc: self, strings: r.d.into_strings() })
     }
 
     /// Every rid with at least one entry (`resource_values`' keys), in rid
@@ -974,7 +981,7 @@ pub struct ResolvedStrings {
 pub enum Item {
     /// A plain string inside a complex entry's list.
     Str(u32),
-    /// (config, value).
+    /// (config: the type chunk whose config object it is, value).
     Pair(u32, Val),
 }
 
@@ -983,12 +990,26 @@ pub enum Val {
     List(Vec<Item>),
 }
 
-/// Result of `Arsc::resolved_res_configs`: strings and configs are indices
-/// into `strings` and `configs`.
+/// Result of `Arsc::resolved_res_configs`: strings index `strings`, configs
+/// are type chunks (see `config_key`, `config_bytes`).
 pub struct Resolved<'a> {
     pub items: Vec<Item>,
-    pub configs: &'a [ConfigKey],
+    arsc: &'a Arsc,
     pub strings: Vec<String>,
+}
+
+impl Resolved<'_> {
+    /// `_get_tuple()` of the config of chunk `c`.
+    pub fn config_key(&self, c: u32) -> ConfigKey {
+        self.arsc.configs[self.arsc.chunks[c as usize].config as usize]
+    }
+
+    /// (start, bytes) androguard's `ARSCResTableConfig(buff)` read for the
+    /// config of chunk `c`.
+    pub fn config_bytes(&self, c: u32) -> (u32, &[u8]) {
+        let (a, b) = self.arsc.chunks[c as usize].config_span;
+        (a, &self.arsc.buf[a as usize..b as usize])
+    }
 }
 
 /// Decodes pool strings for one query, each distinct one once, within
@@ -1262,7 +1283,7 @@ fn read_arsc(zip: &ApkZip) -> Result<Option<Vec<u8>>> {
 
 // ── `values[package][locale]["string"]`: get_string() and
 // get_string_resources(), for androguard's APK._get_res_string_value() and
-// direct callers. Kept in their own block, apart from the queries above.
+// ARSCParser.get_string()/get_string_resources(). Kept in their own block.
 
 impl Arsc {
     /// `values[package][locale]["string"]` as (key, value) pairs in

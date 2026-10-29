@@ -19,6 +19,7 @@ a DEX file! Wrong endian tag: ...": the two header errors that
 import struct
 import zlib
 
+import dexbuild as DB
 import fixture_apk as F
 from dup_cases import C, X, _apk_raw, call, cls, init, m, string
 
@@ -107,6 +108,208 @@ def _share(dex: bytes) -> bytes:
     return _fix(buf)
 
 
+# Past the header: androguard's DEX() parses every map section up front
+# (MapList in TypeMapItem load order) and fails on a broken map list or
+# item; Analysis.add() fails on try/catch handlers it can't match and on
+# hidden-API flags missing for a class; create_xref() fails on an empty
+# type name. Built on dexbuild.base_spec() (classes LA;, LB;, LI;; LA;.foo
+# has a const-string, LB;.baz a try/catch-all).
+
+
+def _base():
+    """dexbuild.base_spec() with LB;.baz's try pointing at its handler (the
+    handler list's first handler is 1 byte in, after its count; base_spec's
+    0 is itself an IndexError in Analysis.add())."""
+    sp = DB.base_spec()
+    sp["codes"]["c_baz"] = DB.code_item(1, 1, 0, bytes.fromhex("0e00"), tries=struct.pack("<IHH", 0, 1, 1),
+                                        handlers=DB.uleb(1) + DB.sleb(0) + DB.uleb(0), n_tries=1)
+    return sp
+
+
+def _spec(**kw):
+    sp = _base()
+    sp.update(kw)
+    return sp
+
+
+def _built(**kw) -> bytes:
+    return DB.build(_spec(**kw))[0]
+
+
+def _map_edit(fn):
+    """A map_hook that applies fn(entries, labels)."""
+    return fn
+
+
+def _drop(ty):
+    return lambda entries, L: entries.__setitem__(slice(None), [e for e in entries if e[0] != ty])
+
+
+def _grow(ty, by):
+    def hook(entries, L):
+        for e in entries:
+            if e[0] == ty:
+                e[1] += by
+    return hook
+
+
+def _move(ty, off):
+    def hook(entries, L):
+        for e in entries:
+            if e[0] == ty:
+                e[2] = off
+    return hook
+
+
+def _patch_u32(label, delta, value):
+    return lambda buf, L: struct.pack_into("<I", buf, L[label] + delta, value)
+
+
+def _patch_u16(label, delta, value):
+    return lambda buf, L: struct.pack_into("<H", buf, L[label] + delta, value)
+
+
+def _append_section(ty, payload: bytes):
+    """A patch that appends `payload` and a map entry of type `ty` for it
+    (the map list moves to the end)."""
+    def patch(buf, L):
+        while len(buf) % 4:
+            buf.append(0)
+        off = len(buf)
+        buf += payload
+        mo = L["map"]
+        n = struct.unpack_from("<I", buf, mo)[0]
+        ents = bytes(buf[mo + 4:mo + 4 + 12 * n]) + struct.pack("<HHII", ty, 0, 1, off)
+        while len(buf) % 4:
+            buf.append(0)
+        new = len(buf)
+        buf += struct.pack("<I", n + 1) + ents
+        struct.pack_into("<I", buf, 52, new)
+        for k in range(n + 1):
+            if struct.unpack_from("<H", buf, new + 4 + 12 * k)[0] == DB.MAP_LIST:
+                struct.pack_into("<I", buf, new + 4 + 12 * k + 8, new)
+        struct.pack_into("<I", buf, 32, len(buf))
+    return patch
+
+
+def _hidden(flags, n=None):
+    """A HIDDENAPI_CLASS_DATA_ITEM with `n` class offsets (default: one per
+    flag) and those flags."""
+    n = len(flags) if n is None else n
+    body = b"".join(struct.pack("<I", 4 + 4 * n) for _ in range(n)) + b"".join(DB.uleb(f) for f in flags)
+    return struct.pack("<I", 4 + len(body)) + body
+
+
+def _nested(n, kind="array"):
+    """An encoded_array_item (or annotation_item) nesting n arrays (or
+    annotations) in each other, ending in null."""
+    if kind == "array":
+        return DB.uleb(1) + (b"\x1c" + DB.uleb(1)) * n + b"\x1e"
+    one = DB.uleb(0) + DB.uleb(1) + DB.uleb(0)
+    return b"\x01" + one + (b"\x1d" + one) * n + b"\x1e"
+
+
+def _foo_insns(insns: bytes):
+    """_base() with LA;.foo's code replaced (same length, 8 bytes)."""
+    sp = _base()
+    sp["codes"]["c_foo"] = DB.code_item(3, 2, 0, insns)
+    return sp
+
+
+def _with_type(name: bytes, insns_fn):
+    """base_spec plus a type named `name` (string and type appended last),
+    LA;.foo's code from insns_fn(type_idx, method_idx); a method of that
+    type is added too."""
+    sp = _base()
+    sp["strings"] = sp["strings"] + [name]
+    sp["types"] = sp["types"] + [len(sp["strings"]) - 1]
+    t = len(sp["types"]) - 1
+    sp["methods"] = sp["methods"] + [(t, 0, sp["strings"].index(b"bar"))]
+    sp["codes"]["c_foo"] = DB.code_item(3, 2, 1, insns_fn(t, len(sp["methods"]) - 1))
+    return sp
+
+
+def _odd_tail(buf, L):
+    """Move LA;.foo's code to a new last CODE_ITEM section at the end of the
+    file, its insns cut to an odd length by the end of the file."""
+    while len(buf) % 4:
+        buf.append(0)
+    at = len(buf)
+    old = DB.uleb(L["c_foo"])
+    new = DB.uleb(at)
+    assert len(old) == len(new)
+    cd = L["cd_A"]
+    i = buf.index(old, cd)
+    buf[i:i + len(old)] = new
+    # registers, ins, outs, tries, debug, insns_size=4; then 5 bytes
+    buf += struct.pack("<4H2I", 3, 2, 0, 0, 0, 4) + bytes([0x12, 0x00, 0x0F, 0x00, 0x0E])
+    mo = L["map"]
+    n = struct.unpack_from("<I", buf, mo)[0]
+    for k in range(n):
+        if struct.unpack_from("<H", buf, mo + 4 + 12 * k)[0] == DB.CODE:
+            struct.pack_into("<II", buf, mo + 4 + 12 * k + 4, 1, at)
+    struct.pack_into("<I", buf, 32, len(buf))
+
+
+def _no_nul_tail(buf, L):
+    """A last STRING_DATA_ITEM section whose string runs to the end of the
+    file without a NUL: androguard's read_null_terminated_string never
+    returns."""
+    while len(buf) % 4:
+        buf.append(0)
+    _append_section(DB.STRING_DATA, b"\x03abc")(buf, L)
+    # the map list is now last: put the string after it
+    buf += b""
+    mo = struct.unpack_from("<I", buf, 52)[0]
+    n = struct.unpack_from("<I", buf, mo)[0]
+    struct.pack_into("<I", buf, mo + 4 + 12 * (n - 1) + 8, len(buf))
+    buf += b"\x05abcde"
+    struct.pack_into("<I", buf, 32, len(buf))
+
+
+LOAD_CASES = {
+    # DEX(): the map list and its sections
+    "map_unknown_type": lambda: _built(map_hook=lambda e, L: e.insert(1, [0x1234, 1, 0x70])),
+    "map_count_past_end": lambda: _built(patch=lambda b, L: struct.pack_into("<I", b, L["map"], 100)),
+    "map_off_past_end": lambda: _built(patch=lambda b, L: struct.pack_into("<I", b, 52, len(b) - 2)),
+    "string_ids_past_end": lambda: _built(map_hook=_grow(DB.STRING_ID, 10000)),
+    "class_defs_past_end": lambda: _built(map_hook=_grow(DB.CLASS_DEF, 100)),
+    "code_past_end": lambda: _built(map_hook=_grow(DB.CODE, 1000)),
+    "no_type_ids": lambda: _built(map_hook=_drop(DB.TYPE_ID)),
+    "no_string_ids": lambda: _built(map_hook=_drop(DB.STRING_ID)),
+    "no_proto_ids": lambda: _built(map_hook=_drop(DB.PROTO_ID)),
+    "interfaces_undeclared": lambda: _built(patch=_patch_u32("class_defs", 12, 0x70)),
+    "proto_out_of_range": lambda: _built(patch=_patch_u16("method_ids", 8 + 2, 0x7FFF)),
+    "proto_params_undeclared": lambda: _built(patch=_patch_u32("proto_ids", 12 + 8, 0x70)),
+    "annotations_no_directory": lambda: _built(patch=_patch_u32("class_defs", 32 + 20, 0x70)),
+    "static_values_not_found": lambda: _built(patch=_patch_u32("class_defs", 32 + 28, 0x70)),
+    "static_values_no_section": lambda: _built(map_hook=_drop(DB.ENCODED_ARRAY)),
+    "header_item_moved": lambda: _built(map_hook=_move(DB.HEADER, 0x10)),
+    "hidden_bad_restriction": lambda: _built(patch=_append_section(0xF000, _hidden([1, 7, 2]))),
+    "hidden_bad_domain": lambda: _built(patch=_append_section(0xF000, _hidden([1, 3 << 3, 2]))),
+    "nested_annotations_ok": lambda: _built(patch=_append_section(0x2004, _nested(50, "annotation"))),
+    "nested_arrays_recursion": lambda: _built(patch=_append_section(DB.ENCODED_ARRAY, _nested(3000))),
+    "nested_annotations_recursion": lambda: _built(patch=_append_section(0x2004, _nested(3000, "annotation"))),
+    # Analysis.add()
+    "no_map": lambda: _built(patch=lambda b, L: struct.pack_into("<I", b, 52, 0)),
+    "no_method_ids": lambda: _built(map_hook=_drop(DB.METHOD_ID)),
+    "hidden_short": lambda: _built(patch=_append_section(0xF000, _hidden([1, 2]))),
+    "bad_handler_off": lambda: _built(patch=lambda b, L: struct.pack_into("<H", b, L["c_baz"] + 16 + 2 + 2 + 6, 5)),
+    "base_spec_handler": lambda: DB.build(DB.base_spec())[0],
+    "odd_code_at_end": lambda: _built(patch=_odd_tail),
+    # create_xref()
+    "const_class_empty_type": lambda: DB.build(_with_type(b"[", lambda t, mi: struct.pack("<BBH", 0x1C, 0, t) + bytes([0x0F, 0, 0, 0])))[0],
+    "new_instance_empty_type": lambda: DB.build(_with_type(b"", lambda t, mi: struct.pack("<BBH", 0x22, 0, t) + bytes([0x0F, 0, 0, 0])))[0],
+    "invoke_array_class": lambda: DB.build(_with_type(b"[[", lambda t, mi: struct.pack("<BBHH", 0x6E, 0x10, mi, 0) + bytes([0x0F, 0])))[0],
+    "sget_no_field_ids": lambda: DB.build(dict(_foo_insns(struct.pack("<BBH", 0x60, 0, 0) + bytes([0x0F, 0, 0, 0])),
+                                                map_hook=_drop(DB.FIELD_ID)))[0],
+    "const_class_ok_array": lambda: DB.build(_with_type(b"[I", lambda t, mi: struct.pack("<BBH", 0x1C, 0, t) + bytes([0x0F, 0, 0, 0])))[0],
+}
+
+# androguard never returns on this one (see _no_nul_tail); not in CASES.
+HANG_CASES = {"string_no_nul_at_end": lambda: _built(patch=_no_nul_tail),
+              "string_data_past_end": lambda: _built(map_hook=_grow(DB.STRING_DATA, 1000))}
+
 CASES = {
     "ok": lambda: _apk_raw(ok_dex()),
     "ok_two": lambda: _apk_raw(ok_dex(), F.dex([cls(X, direct=[init()])])),
@@ -131,6 +334,13 @@ CASES = {
     "short_then_ok": lambda: _apk_raw(short(), ok_dex()),
     "byteswap_then_bad": lambda: _apk_raw(byteswap(), bad_dex()),
     "bad_then_byteswap": lambda: _apk_raw(bad_dex(), byteswap()),
+    **{name: (lambda mk=mk: _apk_raw(mk())) for name, mk in LOAD_CASES.items()},
+    # orders across DEX files: DEX() and add() of each in turn, create_xref() last
+    "xref_then_add": lambda: _apk_raw(LOAD_CASES["const_class_empty_type"](), LOAD_CASES["bad_handler_off"]()),
+    "add_then_load": lambda: _apk_raw(LOAD_CASES["hidden_short"](), LOAD_CASES["map_unknown_type"]()),
+    "load_then_add": lambda: _apk_raw(LOAD_CASES["no_type_ids"](), LOAD_CASES["no_map"]()),
+    "ok_then_xref": lambda: _apk_raw(ok_dex(), LOAD_CASES["sget_no_field_ids"]()),
+    "xref_then_xref": lambda: _apk_raw(LOAD_CASES["invoke_array_class"](), LOAD_CASES["sget_no_field_ids"]()),
 }
 
 

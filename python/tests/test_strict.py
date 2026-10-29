@@ -62,3 +62,25 @@ def test_dex_header_errors_direct():
         with pytest.raises(exc):
             DEX(mk())
     assert [c.get_name() for c in DEX(K.ok_dex()).get_classes()] == [K.C]
+
+
+@pytest.mark.parametrize("name", list(K.HANG_CASES))
+def test_androguard_never_returns(name):
+    """A string_data_item running to the end of the file without a NUL:
+    androguard 4.1.3's read_null_terminated_string loops forever (its list
+    of empty reads grows until memory runs out). We raise MemoryError, the
+    exception androguard would end with, at once."""
+    raw = K.HANG_CASES[name]()
+    with pytest.raises(MemoryError):
+        DEX(raw)
+    with pytest.raises(MemoryError):
+        AnalyzeAPK(K._apk_raw(raw), raw=True)
+
+
+def test_load_error_types():
+    """The exception classes and enum messages are androguard's."""
+    from androguard_rs.dex import HiddenApiClassDataItem, TypeMapItem
+
+    assert repr(KeyError(TypeMapItem.CODE_ITEM)) == "KeyError(<TypeMapItem.CODE_ITEM: 8193>)"
+    with pytest.raises(ValueError, match=r"^7 is not a valid HiddenApiClassDataItem.RestrictionApiFlag$"):
+        HiddenApiClassDataItem.RestrictionApiFlag(7)

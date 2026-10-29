@@ -26,6 +26,13 @@ use rustc_hash::FxHashMap;
 
 use crate::dex::{Dex, slice, u16_at, u32_at};
 
+const STRING_ID_ITEM: u16 = 0x1;
+const TYPE_ID_ITEM: u16 = 0x2;
+const PROTO_ID_ITEM: u16 = 0x3;
+const FIELD_ID_ITEM: u16 = 0x4;
+const METHOD_ID_ITEM: u16 = 0x5;
+const CLASS_DEF_ITEM: u16 = 0x6;
+const STRING_DATA_ITEM: u16 = 0x2002;
 const TYPE_LIST: u16 = 0x1001;
 const CLASS_DATA_ITEM: u16 = 0x2000;
 const CODE_ITEM: u16 = 0x2001;
@@ -46,6 +53,16 @@ pub struct Declared {
     /// None when the map has no ENCODED_ARRAY_ITEM entry.
     encoded_arrays: Option<Vec<u32>>,
     pub(crate) has_annotations_dir: bool,
+    /// Offsets of every string_data_item (`__strings_off`): a string_id
+    /// pointing elsewhere is "AG:IS: invalid string" in androguard.
+    string_data: Vec<u32>,
+    /// The id tables as androguard reads them, from the map list (None
+    /// without one): (start, count) of string_ids (the last STRING_ID_ITEM
+    /// section, read from its offset), type_ids, proto_ids, field_ids and
+    /// method_ids (the last section of each, read from `offset + offset %
+    /// 4`), and class_defs (the first CLASS_DEF_ITEM section). Counts are
+    /// cut to what fits in the file.
+    pub(crate) tables: Option<[(usize, usize); 6]>,
 }
 
 fn has(v: &[u32], off: u32) -> bool {
@@ -69,6 +86,29 @@ impl Declared {
             }
         }
         let entries = |ty| by_type.get(&ty).map(Vec::as_slice).unwrap_or(&[]);
+        if map_off != 0 {
+            let table = |ty: u16, entry: usize, first: bool, aligned: bool| -> (usize, usize) {
+                let e = if first { entries(ty).first() } else { entries(ty).last() };
+                let Some(&(size, off)) = e else { return (0, 0) };
+                let start = off as usize + if aligned { off as usize % 4 } else { 0 };
+                let fits = data.len().saturating_sub(start) / entry;
+                (start, (size as usize).min(fits))
+            };
+            d.tables = Some([
+                table(STRING_ID_ITEM, 4, false, false),
+                table(TYPE_ID_ITEM, 4, false, true),
+                table(PROTO_ID_ITEM, 12, false, true),
+                table(FIELD_ID_ITEM, 8, false, true),
+                table(METHOD_ID_ITEM, 8, false, true),
+                table(CLASS_DEF_ITEM, 32, true, true),
+            ]);
+        }
+        let sd: Vec<(u32, usize)> = entries(STRING_DATA_ITEM).iter().map(|&(s, o)| (s, o as usize)).collect();
+        d.string_data = walk(data, &sd, false, |b, p| {
+            let mut p = p;
+            ag_uleb128(b, &mut p).ok()?;
+            memchr::memchr(0, b.get(p..)?).map(|n| p + n + 1)
+        });
         d.has_annotations_dir = !entries(ANNOTATIONS_DIRECTORY_ITEM).is_empty();
 
         // CODE_ITEM: MapItem.parse seeks to `offset + offset % 4` (not an
@@ -296,6 +336,11 @@ impl Dex {
     /// Whether androguard has a code_item at `off` (`ClassManager.get_code`).
     pub fn has_code_item(&self, off: u32) -> bool {
         has(&self.declared.code, off)
+    }
+
+    /// Whether androguard has a string_data_item at `off`.
+    pub fn has_string_data(&self, off: u32) -> bool {
+        has(&self.declared.string_data, off)
     }
 
     /// Whether a class_def's class_data_off gives it a class_data_item:

@@ -1,10 +1,8 @@
 """``androguard.core.analysis.analysis.Analysis`` drop-in for code that builds
-the analysis itself from per-DEX objects::
+the analysis itself, from each DEX's bytes::
 
-    # from androguard.core.dex import DEX
-    # from androguard.core.analysis.analysis import Analysis
-    from androguard_rs.dex import DEX
-    from androguard_rs.analysis import Analysis
+    from androguard_rs.core.dex import DEX                     # androguard.core.dex
+    from androguard_rs.core.analysis.analysis import Analysis  # androguard.core.analysis.analysis
 
     vmx = Analysis()
     for raw in apk.get_all_dex():
@@ -30,7 +28,7 @@ index then, as if it had run (androguard would answer without xrefs).
 
 from __future__ import annotations
 
-from . import _native
+from . import _agerr, _native
 from ._analysis import Analysis as _Facade
 from ._analysis import ClassAnalysis, MethodAnalysis  # noqa: F401
 from .dex import DEX
@@ -81,14 +79,16 @@ class Analysis(_Facade):
         if self._rs_index is not None:
             raise NotImplementedError("androguard_rs.analysis: add() after the index was built")
         self._added.append(vm)
-        exc = _native._dex_first_invalid(vm._raw)
-        if exc is not None:
-            raise exc
+        if vm._ag_add is not None:
+            raise _agerr.make(vm._ag_add)
 
     def create_xref(self) -> None:
         if self._xrefs_done:
             # androguard logs an error and returns.
             return
         self._xrefs_done = True
+        for vm in self._added:
+            if vm._ag_xref is not None:
+                raise _agerr.make(vm._ag_xref)
         if self._rs_index is None:
             self._build()

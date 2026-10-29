@@ -12,7 +12,7 @@
 
 use std::cell::RefCell;
 
-use dex_bytecode::{DexError, RefKind, ResolveRef, decode_one_with_resolver};
+use dex_bytecode::{DexError, RefKind, ResolveRef, decode_length, decode_one_with_resolver};
 
 use crate::dex::Dex;
 use crate::render::AgResolver;
@@ -85,6 +85,64 @@ fn ref_kind(op: u8) -> RefKind {
     }
 }
 
+/// A payload's `(get_length(), len(get_raw()))`, as androguard computes
+/// them from its header; `rest` starts at the payload.
+pub fn payload_lengths(unit: u16, rest: &[u8]) -> (u64, u64) {
+    let remaining = rest.len() as u64;
+    match unit {
+        0x100 => {
+            let size = u16_le(rest, 2);
+            let targets = if size * 4 > remaining { remaining.saturating_sub(16) } else { size };
+            (8 + 4 * size, 8 + 4 * targets)
+        }
+        0x200 => {
+            let l = 4 + 8 * u16_le(rest, 2);
+            (l, l)
+        }
+        _ => {
+            let l = 8 + ((u32_le(rest, 4) * u16_le(rest, 2) + 1) & !1);
+            (l, l.min(remaining))
+        }
+    }
+}
+
+/// One instruction's place in a method's insns: `InsnRow` without the text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InsnSpan {
+    pub off: u32,
+    pub op_value: u16,
+    pub len: u64,
+    pub raw_len: u32,
+}
+
+/// The instructions `insn_rows` gives (same boundaries, same error on
+/// bytecode androguard rejects), without formatting their text or
+/// resolving references.
+pub fn insn_spans(code: &[u8]) -> Result<Vec<InsnSpan>, DexError> {
+    let mut out = Vec::with_capacity(code.len() / 4);
+    let mut off = 0usize;
+    while off < code.len() {
+        let (unit, length) = decode_length(code, off).map_err(|mut e| {
+            e.offset = Some(off);
+            e
+        })?;
+        let rest = &code[off..];
+        let span = if unit > 0xff {
+            let (len, raw_len) = payload_lengths(unit, rest);
+            InsnSpan { off: off as u32, op_value: unit, len, raw_len: raw_len as u32 }
+        } else {
+            InsnSpan { off: off as u32, op_value: unit, len: length as u64, raw_len: length }
+        };
+        let next = off as u64 + span.len;
+        out.push(span);
+        if next >= code.len() as u64 {
+            break;
+        }
+        off = next as usize;
+    }
+    Ok(out)
+}
+
 /// Every instruction of one method's insns, as androguard 4.1.3's
 /// `DCode.get_instructions()` yields them. On bytecode androguard rejects,
 /// the error `decode_all_with_resolver` gives (offset set), and no rows.
@@ -98,46 +156,7 @@ pub fn insn_rows_with<R: ResolveRef>(resolver: &R, code: &[u8]) -> Result<Vec<In
     let mut out = Vec::new();
     let mut off = 0usize;
     while off < code.len() {
-        *cap.last.borrow_mut() = None;
-        let ins = decode_one_with_resolver(code, off, &cap).map_err(|mut e| {
-            e.offset = Some(off);
-            e
-        })?;
-        let rest = &code[off..];
-        let unit = u16_le(rest, 0) as u16;
-        let row = if ins.opcode == 0 && unit > 0xff {
-            // Payloads: lengths as androguard computes them from the header.
-            let remaining = rest.len() as u64;
-            let (len, raw_len) = match unit {
-                0x100 => {
-                    let size = u16_le(rest, 2);
-                    let targets = if size * 4 > remaining { remaining.saturating_sub(16) } else { size };
-                    (8 + 4 * size, 8 + 4 * targets)
-                }
-                0x200 => {
-                    let l = 4 + 8 * u16_le(rest, 2);
-                    (l, l)
-                }
-                _ => {
-                    let l = 8 + ((u32_le(rest, 4) * u16_le(rest, 2) + 1) & !1);
-                    (l, l.min(remaining))
-                }
-            };
-            InsnRow { off: off as u32, op_value: unit, len, raw_len: raw_len as u32, output: Some(ins.operands), kind: None }
-        } else {
-            let op = ins.opcode;
-            let kind = ref_index(op, rest).and_then(|idx| match ref_kind(op) {
-                // androguard's get_kind() has no branch for PROTO / CALL_SITE.
-                RefKind::None => None,
-                k => Some(cap.last.borrow_mut().take().unwrap_or_else(|| {
-                    // 35c with more than 5 registers prints nothing, so the
-                    // decoder resolved nothing; androguard still resolves it.
-                    cap.inner.resolve(k, idx).unwrap_or_default()
-                })),
-            });
-            let output = if ins.output_is_none { None } else { Some(ins.operands) };
-            InsnRow { off: off as u32, op_value: op as u16, len: ins.length as u64, raw_len: ins.length, output, kind }
-        };
+        let row = row_at(&cap, code, off)?;
         // The sweep stops once an instruction's length reaches the end.
         let next = off as u64 + row.len;
         out.push(row);
@@ -147,6 +166,58 @@ pub fn insn_rows_with<R: ResolveRef>(resolver: &R, code: &[u8]) -> Result<Vec<In
         off = next as usize;
     }
     Ok(out)
+}
+
+/// The row of the instruction starting at `off` (an offset `insn_spans`
+/// gives): what `insn_rows` has for it, decoding only that instruction.
+pub fn insn_row_at(dex: &Dex, code: &[u8], off: usize) -> Result<InsnRow, DexError> {
+    let cap = Capture { inner: &AgResolver { dex }, last: RefCell::new(None) };
+    row_at(&cap, code, off)
+}
+
+/// What an instruction's resolved reference (`InsnRow::kind`) depends on,
+/// besides the DEX: its opcode and reference index, for the instruction at
+/// `off` (an offset `insn_spans` gives); None for one without a reference
+/// androguard resolves (its `kind` is None).
+pub fn kind_key(code: &[u8], off: usize) -> Option<(u8, u32)> {
+    let rest = code.get(off..)?;
+    let unit = u16_le(rest, 0) as u16;
+    if unit > 0xff && (unit as u8 == 0 || unit as u8 == 0xff) {
+        return None;
+    }
+    let op = unit as u8;
+    let idx = ref_index(op, rest)?;
+    match ref_kind(op) {
+        RefKind::None => None,
+        _ => Some((op, idx)),
+    }
+}
+
+fn row_at<R: ResolveRef>(cap: &Capture<'_, R>, code: &[u8], off: usize) -> Result<InsnRow, DexError> {
+    *cap.last.borrow_mut() = None;
+    let ins = decode_one_with_resolver(code, off, cap).map_err(|mut e| {
+        e.offset = Some(off);
+        e
+    })?;
+    let rest = &code[off..];
+    let unit = u16_le(rest, 0) as u16;
+    Ok(if ins.opcode == 0 && unit > 0xff {
+        let (len, raw_len) = payload_lengths(unit, rest);
+        InsnRow { off: off as u32, op_value: unit, len, raw_len: raw_len as u32, output: Some(ins.operands), kind: None }
+    } else {
+        let op = ins.opcode;
+        let kind = ref_index(op, rest).and_then(|idx| match ref_kind(op) {
+            // androguard's get_kind() has no branch for PROTO / CALL_SITE.
+            RefKind::None => None,
+            k => Some(cap.last.borrow_mut().take().unwrap_or_else(|| {
+                // 35c with more than 5 registers prints nothing, so the
+                // decoder resolved nothing; androguard still resolves it.
+                cap.inner.resolve(k, idx).unwrap_or_default()
+            })),
+        });
+        let output = if ins.output_is_none { None } else { Some(ins.operands) };
+        InsnRow { off: off as u32, op_value: op as u16, len: ins.length as u64, raw_len: ins.length, output, kind }
+    })
 }
 
 #[cfg(test)]
@@ -282,6 +353,37 @@ mod tests {
         assert!(e.message().contains("0x3e"));
         // Same validity as the formatting decoder on a short read.
         assert!(insn_rows(&d, &[0x14, 0x00, 0x00]).is_err());
+    }
+
+    #[test]
+    fn spans_agree_with_rows() {
+        let d = dex();
+        let codes: Vec<Vec<u8>> = vec![
+            vec![0x12, 0xf1, 0x1a, 0x00, 0x03, 0x00, 0x0e, 0x00],
+            vec![0x00, 0x03, 0x01, 0x00, 100, 0, 0, 0, 7, 8],
+            vec![0x00, 0x01, 0x10, 0x00, 0, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0],
+            vec![0x0e, 0x00, 0x00, 0x02, 0x01, 0x00, 1, 0, 0, 0, 2, 0, 0, 0],
+            vec![0x0e, 0x00, 0x3e, 0x00],
+            vec![0x14, 0x00, 0x00],
+            vec![0x0e, 0x01],
+            vec![0x00, 0x05, 0x00, 0x00],
+            vec![0xfa, 0x60, 0, 0, 0, 0, 0, 0],
+        ];
+        for code in codes {
+            match (insn_rows(&d, &code), insn_spans(&code)) {
+                (Ok(rows), Ok(spans)) => {
+                    let r: Vec<_> = rows.iter().map(|r| (r.off, r.op_value, r.len, r.raw_len)).collect();
+                    let s: Vec<_> = spans.iter().map(|s| (s.off, s.op_value, s.len, s.raw_len)).collect();
+                    assert_eq!(r, s);
+                    for row in &rows {
+                        assert_eq!(&insn_row_at(&d, &code, row.off as usize).unwrap(), row);
+                        assert_eq!(kind_key(&code, row.off as usize).is_some(), row.kind.is_some());
+                    }
+                }
+                (Err(a), Err(b)) => assert_eq!((a.offset, a.message()), (b.offset, b.message())),
+                (a, b) => panic!("{code:?}: {a:?} vs {b:?}"),
+            }
+        }
     }
 
     #[test]

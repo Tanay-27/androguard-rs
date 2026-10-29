@@ -55,16 +55,19 @@ def test_no_androguard_needed(path):
 def test_get_classes(dx, monkeypatch):
     assert [(c.name, c.is_external()) for c in dx.get_classes()] == G["classes"]
     assert len(dx.get_classes()) == len(G["classes"])
-    # Smaller slices than the class count: the walk is still the same.
-    monkeypatch.setattr(compat.Analysis, "_SLICE", 3)
-    assert [c.name for c in dx.get_classes()] == [n for n, _ in G["classes"]]
+    # A second walk hands out equal objects (androguard's are the same
+    # objects; here each query makes handles), hashing alike.
+    first, again = list(dx.get_classes()), list(dx.get_classes())
+    assert all(a == b and hash(a) == hash(b) for a, b in zip(first, again))
+    assert not any(a == b for a, b in zip(first, again[1:]))
+    assert len(set(first) | set(again)) == len(first)
 
 
 def test_get_class_analysis(dx):
     for name, ext in G["classes"]:
         ca = dx.get_class_analysis(name)
         assert (ca.name, ca.is_external()) == (name, ext)
-        assert dx.get_class_analysis(name) is ca  # interned while alive
+        assert dx.get_class_analysis(name) == ca and hash(dx.get_class_analysis(name)) == hash(ca)
     assert dx.get_class_analysis("Lno/such/Class;") is None
     assert dx.get_class_analysis("Lcom/ex/Main") is None
     assert dx.get_class_analysis(None) is None

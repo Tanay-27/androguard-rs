@@ -5,23 +5,28 @@ androguard 4.1.3's ``AnalyzeAPK`` returns an ``Analysis`` (``dx``) whose
 field and ``ARSCParser`` objects callers walk. This module provides lazy,
 lightweight stand-ins for those objects, with androguard's attributes and
 results, backed by ``androguard_rs.Apk`` and ``androguard_rs.Resources``.
-It ships as ``androguard_rs._analysis``. Nothing is built for the whole APK up front:
+It ships as ``androguard_rs._analysis``. Nothing is built for the whole APK
+up front, and nothing is kept on the Python side: every object a query
+returns is made for it, and only the ``Analysis`` (and the DEX objects) live
+on.
 
-- ``Analysis`` keeps nothing per class: ``get_classes()`` walks the native
-  class list a slice at a time, ``get_class_analysis()`` is a native lookup,
-  and ``ClassDefItem`` asks for one class's superclass/interfaces.
+- The class list, each class's methods and a table of method names are
+  native: a ``find_methods()`` / ``find_classes()`` pattern with a literal
+  prefix looks only at the class names that start with it, and a method
+  name pattern with one only at the classes having such a method (and at
+  only those rows). ``get_class_analysis()`` is a native lookup, and
+  ``ClassDefItem`` asks for one class's superclass/interfaces.
 - ``get_fields()`` (own fields, then the foreign fields the class's code
   touches) and typed ``init_value.value`` come from ``class_fields()``;
-  ``get_code().get_bc().get_instructions()`` from ``instructions()``, as
-  ``androguard_rs.dex`` Instruction objects.
-- ``ClassAnalysis`` objects are created on demand and interned weakly, so a
-  full walk over every class doesn't keep them all alive.
+  ``get_code().get_bc().get_instructions()`` are ``androguard_rs.dex``
+  Instruction handles.
+- ``ClassAnalysis``, ``MethodAnalysis`` and the rest are handles made per
+  query that compare (and hash) by what they stand for: two
+  ``get_classes()`` walks give equal, not identical, ``ClassAnalysis``
+  objects (androguard's are the same objects).
 - ``MethodAnalysis`` objects carry one ``class_methods()`` row; xref
   endpoints carry only what ``xref_from()``/``xref_to()`` return and fetch the
   rest of their row when asked.
-- Decoded instructions live in a small bounded LRU on the ``Analysis``, so
-  walking the same method's instructions twice in a row decodes it once,
-  without keeping a whole-APK cache.
 
 Anything else raises ``NotImplementedError`` naming the attribute, and every
 such hit is counted in ``GAPS`` (callers often swallow exceptions, so the
@@ -36,13 +41,12 @@ that module); ``analyze_apk(path, native_apk=False)`` gives androguard's real
 from __future__ import annotations
 
 import re
-import threading
-import weakref
 from bisect import bisect_left
-from collections import Counter, OrderedDict
+from collections import Counter
 from typing import Iterator
 
 import androguard_rs
+from androguard_rs import _arscconfig
 from androguard_rs import dex as _dex
 
 __all__ = ["analyze_apk", "Analysis", "ARSCParser", "GAPS", "NOTES"]
@@ -81,7 +85,7 @@ def _full_key(key, cls: str):
 #: from an AnalyzeAPK result), by this module's class name. An attribute
 #: androguard has that isn't implemented here is a gap (NotImplementedError,
 #: counted in GAPS); one androguard doesn't have either is an AttributeError,
-#: as androguard raises (callers may catch it).
+#: as androguard raises (callers probing attributes catch it).
 _AG_ATTRS = {
     'Analysis': frozenset([
         '_Analysis__created_xrefs', '_Analysis__method_hashes', '_create_xref', '_resolve_method', 'add',
@@ -188,9 +192,8 @@ class _Loud:
 #
 # Instruction objects are androguard_rs.dex's classes (Instruction11n,
 # Instruction35c, PackedSwitch, ...), built per method from one native call
-# and kept in the Analysis's bounded LRU: while a method stays there,
-# get_instructions() returns the same objects every time, as androguard's
-# cached list does.
+# and kept by the DEX object: get_instructions() returns the same objects
+# every time, as androguard's cached list does.
 #
 # androguard_rs models androguard after AnalyzeAPK/create_xref(), which has
 # disassembled (and cached) every method: get_instruction(idx) works without
@@ -207,6 +210,12 @@ class _Code(_Loud):
 
     def __init__(self, ma: "MethodAnalysis"):
         self._ma = ma
+
+    def __eq__(self, other):
+        return isinstance(other, _Code) and self._ma == other._ma
+
+    def __hash__(self):
+        return hash(("_Code", self._ma))
 
     def get_bc(self) -> "_DCode":
         return _DCode(self._ma)
@@ -225,11 +234,17 @@ class _DCode(_Loud):
     def __init__(self, ma: "MethodAnalysis"):
         self._ma = ma
 
-    def _decoded(self):
+    def __eq__(self, other):
+        return isinstance(other, _DCode) and self._ma == other._ma
+
+    def __hash__(self):
+        return hash(("_DCode", self._ma))
+
+    def _all(self):
         return self._ma._dx._insns(self._ma._key)
 
     def get_instructions(self) -> Iterator:
-        yield from self._decoded()[0]
+        yield from self._all()
 
     def is_cached_instructions(self) -> bool:
         return True
@@ -241,15 +256,24 @@ class _DCode(_Loud):
         instruction), and a position out of range raises IndexError."""
         if off is not None:
             idx = self.off_to_pos(off)
-        return self._decoded()[0][idx]
+        loc = self._ma._dx._code_loc(self._ma._key)
+        if loc is not None and type(idx) is int and -(1 << 62) < idx < (1 << 62):
+            rs, d, code_off = loc
+            return rs._insn_at(d, code_off, idx, _dex._Insns, _dex._CLASSES)
+        return _dex._at(self._all(), idx)
 
     def off_to_pos(self, off: int) -> int:
-        offs = self._decoded()[1]
+        loc = self._ma._dx._code_loc(self._ma._key)
+        if loc is not None and type(off) is int:
+            rs, d, code_off = loc
+            return rs._insn_pos(d, code_off, off)[1]
+        offs = [i._row for i in self._all()]
         i = bisect_left(offs, off)
         return i if i < len(offs) and offs[i] == off else -1
 
     def get_ins_off(self, off: int):
-        insns, offs = self._decoded()
+        insns = self._all()
+        offs = [i._row for i in insns]
         i = bisect_left(offs, off)
         return insns[i] if i < len(offs) and offs[i] == off else None
 
@@ -266,14 +290,28 @@ class _DCode(_Loud):
 # ── Methods ───────────────────────────────────────────────────────────────────
 
 
+def _from_dex_method(slot: str) -> property:
+    return property(lambda self: getattr(self._dex_method(), slot))
+
+
 class EncodedMethod(_Loud, _dex.EncodedMethod):
     """A MethodAnalysis's EncodedMethod. Name, descriptor, flags and code come
     from its class_methods() row and native key; the rest (code_off,
     registers, get_information(), str(), CM, equality) from the DEX-level
-    EncodedMethod it is (androguard_rs.dex.EncodedMethod), found on first
-    use."""
+    EncodedMethod handle it is (androguard_rs.dex.EncodedMethod), found on
+    first use."""
 
     __slots__ = ("_ma", "_dexm")
+
+    # The DEX-level handle's keys, read from it.
+    _core = _from_dex_method("_core")
+    _rs = _from_dex_method("_rs")
+    _d = _from_dex_method("_d")
+    _off = _from_dex_method("_off")
+    _pos = _from_dex_method("_pos")
+    _idx = _from_dex_method("_idx")
+    _flags = _from_dex_method("_flags")
+    _code_off = _from_dex_method("_code_off")
 
     def __init__(self, ma: "MethodAnalysis"):
         self._ma = ma
@@ -286,7 +324,7 @@ class EncodedMethod(_Loud, _dex.EncodedMethod):
             if loc is None:
                 _gap("EncodedMethod", f"<location of {ma._sig}>")
             d, ci, _off, pos = loc
-            self._dexm = ma._dx._vm_views()[d].get_classes()[ci].get_methods()[pos]
+            self._dexm = ma._dx._vm_views()[d]._method(ci, pos)
         return self._dexm
 
     def _ident(self):
@@ -294,10 +332,6 @@ class EncodedMethod(_Loud, _dex.EncodedMethod):
 
     __eq__ = _dex.EncodedMethod.__eq__
     __hash__ = _dex.EncodedMethod.__hash__
-
-    @property
-    def _row(self):
-        return self._dex_method()._row
 
     @property
     def _vm(self):
@@ -340,14 +374,21 @@ class EncodedMethod(_Loud, _dex.EncodedMethod):
     def get_code(self):
         return _Code(self._ma) if self._ma._dx._rs.has_code(self._ma._key) else None
 
+    def _has_code(self) -> bool:
+        return self._ma._dx._rs.has_code(self._ma._key)
+
+    def get_length(self) -> int:
+        code = self.get_code()
+        return 0 if code is None else code.get_bc().get_length()
+
     def get_instructions_idx(self) -> Iterator:
         # androguard: a generator; no code -> nothing, otherwise every
         # instruction with its byte offset (the running sum of get_length()).
         # An invalid method raises InvalidInstruction on the first next().
         if self.get_code() is None:
             return
-        insns, offs = self._ma._dx._insns(self._ma._key)
-        yield from zip(offs, insns)
+        for i in self._ma._dx._insns(self._ma._key):
+            yield (i._row, i)
 
     def get_instructions(self):
         # androguard: [] without code, else DCode.get_instructions() (a generator).
@@ -645,7 +686,7 @@ class ClassDefItem(_Loud):
         if self._dexc is None:
             dx = self._ca._dx
             d, ci = dx._rs.class_def_position(self._ca.name)
-            self._dexc = dx._vm_views()[d].get_classes()[ci]
+            self._dexc = dx._vm_views()[d]._class(ci)
         return self._dexc
 
     def __eq__(self, other):
@@ -691,6 +732,13 @@ class ExternalClass(_Loud):
     def __init__(self, name: str):
         self.name = name
 
+    # one per class in androguard
+    def __eq__(self, other):
+        return isinstance(other, ExternalClass) and self.name == other.name
+
+    def __hash__(self):
+        return hash(("ExternalClass", self.name))
+
     def get_name(self) -> str:
         return self.name
 
@@ -699,29 +747,33 @@ class ExternalClass(_Loud):
 
 
 class ClassAnalysis(_Loud):
-    __slots__ = ("_dx", "name", "_external", "_rows", "_by_sig", "__weakref__")
+    """A handle on one class of dx.get_classes(): made per query, equal
+    (and hashing equal) to every other for the same class of the same
+    Analysis (androguard has one object per class)."""
+
+    __slots__ = ("_dx", "name", "_external")
 
     def __init__(self, dx: "Analysis", name: str, external: bool):
         self._dx = dx
         self.name = name
         self._external = external
-        self._rows = None
-        self._by_sig = None
+
+    def __eq__(self, other):
+        return isinstance(other, ClassAnalysis) and other._dx is self._dx and other.name == self.name
+
+    def __hash__(self):
+        return hash((id(self._dx), self.name))
 
     def is_external(self) -> bool:
         return self._external
 
     def _method_rows(self):
-        if self._rows is None:
-            self._rows = self._dx._rs.class_methods(self.name) or []
-        return self._rows
+        return self._dx._rs.class_methods(self.name) or []
 
     def _row_of(self, key):
         """The row of a method by its native key (see _row_key; (e,) as
         search_instruction_text(keys=True) gives it is completed here)."""
-        if self._by_sig is None:
-            self._by_sig = {_row_key(r, self.name): r for r in self._method_rows()}
-        return self._by_sig.get(_full_key(key, self.name) if isinstance(key, tuple) and len(key) == 1 else key)
+        return self._dx._rs._class_method_row(self.name, key)
 
     def get_methods(self):
         # For an irregular class (defined more than once, sharing its
@@ -749,9 +801,63 @@ class ClassAnalysis(_Loud):
         return "<analysis.ClassAnalysis {}{}>".format(self.name, " EXTERNAL" if self._external else "")
 
 
+_RE_CACHE: dict = {}
+_RE_CACHE_MAX = 65536
+
+
+def _compiled(pattern: str):
+    """re.compile(pattern), kept per pattern string (re's own cache holds
+    only the last 512 patterns, fewer than a walk over a permission map's
+    signatures uses, so each of those would be compiled again per call)."""
+    p = _RE_CACHE.get(pattern)
+    if p is None:
+        p = re.compile(pattern)
+        if len(_RE_CACHE) >= _RE_CACHE_MAX:
+            _RE_CACHE.clear()
+            _PREFIX_CACHE.clear()
+        _RE_CACHE[pattern] = p
+    return p
+
+
+def _matcher(pattern):
+    """`lambda s: re.match(pattern, s)`, compiled once."""
+    if isinstance(pattern, str):
+        return _compiled(pattern).match
+    return lambda s: re.match(pattern, s)
+
+
+_PREFIX_CACHE: dict = {}
+
+
+def _literal_prefix(pattern: str) -> str:
+    """The literal characters every re.match() of `pattern` starts with
+    ("" if none, or if a flag makes matching case-insensitive)."""
+    p = _PREFIX_CACHE.get(pattern)
+    if p is None:
+        p = _PREFIX_CACHE[pattern] = _parse_prefix(pattern)
+    return p
+
+
+def _parse_prefix(pattern: str) -> str:
+    try:
+        from re import _parser as sre_parse, _constants as sre_c
+    except ImportError:  # Python < 3.11
+        import sre_parse
+        import sre_constants as sre_c
+    compiled = _compiled(pattern)
+    if compiled.flags & (re.IGNORECASE | re.LOCALE):
+        return ""
+    out = []
+    for op, av in sre_parse.parse(pattern, compiled.flags):
+        if op is not sre_c.LITERAL:
+            break
+        out.append(chr(av))
+    return "".join(out)
+
+
 class _ClassesView:
-    """dx.get_classes(): iterates the native class list a slice at a time,
-    creating each ClassAnalysis as it goes; nothing per class is kept."""
+    """dx.get_classes(): iterates the class list (natively, a slice at a
+    time), handing out a ClassAnalysis per class."""
 
     __slots__ = ("_dx",)
 
@@ -759,25 +865,23 @@ class _ClassesView:
         self._dx = dx
 
     def __iter__(self):
-        get = self._dx._class
-        for name, ext in self._dx._entries():
-            yield get(name, ext)
+        dx = self._dx
+        rs = dx._rs
+        n = rs.class_count()
+        for start in range(0, n, 4096):
+            for name, ext in rs.classes_slice(start, start + 4096):
+                yield ClassAnalysis(dx, name, ext)
 
     def __len__(self):
         return self._dx._rs.class_count()
 
 
 class Analysis(_Loud):
-    __slots__ = ("_rs", "_apk", "_interned", "_lock", "_lru", "_views")
-
-    _LRU_SIZE = 256
+    __slots__ = ("_rs", "_apk", "_views")
 
     def __init__(self, rs: "androguard_rs.Apk", apk=None):
         self._rs = rs
         self._apk = apk
-        self._interned = weakref.WeakValueDictionary()
-        self._lock = threading.RLock()
-        self._lru: "OrderedDict[str, list]" = OrderedDict()
         self._views = None
 
     def _vm_views(self) -> list:
@@ -794,47 +898,26 @@ class Analysis(_Loud):
         return self._vm_views()
 
     # internal helpers
-    _SLICE = 1024
-
-    def _entries(self):
-        """(name, is_external) of dx.get_classes(), in order, fetched from the
-        native list a slice at a time."""
-        rs, n, step = self._rs, self._rs.class_count(), self._SLICE
-        for start in range(0, n, step):
-            yield from rs.classes_slice(start, start + step)
-
     def _class(self, name: str, external: bool) -> ClassAnalysis:
-        ca = self._interned.get(name)
-        if ca is None:
-            with self._lock:
-                ca = self._interned.get(name)
-                if ca is None:
-                    ca = ClassAnalysis(self, name, external)
-                    self._interned[name] = ca
-        return ca
+        return ClassAnalysis(self, name, external)
 
     def _method_row(self, cls: str, key):
-        ca = self.get_class_analysis(cls)
-        return None if ca is None else ca._row_of(key)
+        return self._rs._class_method_row(cls, key) if isinstance(cls, str) else None
+
+    def _code_loc(self, key):
+        """(native index, DEX number, code_off) of a method's code by its
+        native key (signature or row key), or None."""
+        rs = self._rs
+        loc = rs._code_location(key)
+        return None if loc is None else (rs, loc[0], loc[1])
 
     def _insns(self, key):
-        """(instructions, their byte offsets) of a method with code, by its
-        native key (signature or row key), from the bounded LRU, so the same
-        objects come back while it's cached."""
-        with self._lock:
-            hit = self._lru.get(key)
-            if hit is not None:
-                self._lru.move_to_end(key)
-                return hit
-        data = self._rs.instructions(key)
-        insns = _dex._instructions(data) if data is not None else []
-        hit = (insns, [r[0] for r in data[1]] if data is not None else [])
-        with self._lock:
-            hit = self._lru.setdefault(key, hit)
-            self._lru.move_to_end(key)
-            if len(self._lru) > self._LRU_SIZE:
-                self._lru.popitem(last=False)
-        return hit
+        """The Instruction handles (a tuple) of a method with code, by its
+        native key (signature or row key); () without code."""
+        loc = self._code_loc(key)
+        if loc is None:
+            return ()
+        return self._vm_views()[loc[1]]._insns(loc[2])
 
     # androguard API
     def get_classes(self):
@@ -846,14 +929,30 @@ class Analysis(_Loud):
         entry = self._rs.class_entry(class_name)
         if entry is None:
             return None
-        return self._class(class_name, entry[1])
+        return ClassAnalysis(self, class_name, entry[1])
+
+    def _matching_classes(self, pattern):
+        """[(position, name, is_external)], in dx.get_classes() order, of the
+        classes whose name re.match()es `pattern`, as androguard's loop over
+        every class finds them. A str pattern's literal prefix (the leading
+        literal characters Python's re parser finds, when no flag makes them
+        case-insensitive) is a prefix every match starts with, so only the
+        names starting with it are tried."""
+        rs = self._rs
+        if not rs.class_count():
+            return []
+        if not isinstance(pattern, str):
+            return [(i, n, e) for i, n, e in rs._classes_prefix("") if re.match(pattern, n)]
+        match = _compiled(pattern).match
+        return [t for t in rs._classes_prefix(_literal_prefix(pattern)) if match(t[1])]
 
     def find_classes(self, name: str = ".*", no_external: bool = False):
-        for cname, ext in self._entries():
+        # androguard 4.1.3: every class, in dx.classes order, whose name
+        # re.match()es `name`.
+        for _i, cname, ext in self._matching_classes(name):
             if no_external and ext:
                 continue
-            if re.match(name, cname):
-                yield self._class(cname, ext)
+            yield ClassAnalysis(self, cname, ext)
 
     def find_methods(self, classname: str = ".*", methodname: str = ".*", descriptor: str = ".*",
                      accessflags: str = ".*", no_external: bool = False):
@@ -862,21 +961,73 @@ class Analysis(_Loud):
         # get_methods() whose method's get_name(), get_descriptor() and
         # get_access_flags_string() ("" for an ExternalMethod, which
         # no_external leaves out) re.match() the other three. The patterns
-        # are used with Python's re as given (unescaped class names,
-        # lookaheads, space-separated descriptors all work as in androguard). Matching
-        # runs on the class_methods() rows; a MethodAnalysis is made only
-        # for a match.
-        for cname, ext in self._entries():
-            if re.match(classname, cname):
-                ca = self._class(cname, ext)
-                for ma in ca.get_methods():
-                    row = ma._full
-                    external = row[4]
-                    if no_external and external:
-                        continue
-                    if (re.match(methodname, row[1]) and re.match(descriptor, row[2])
-                            and re.match(accessflags, "" if external else row[3])):
-                        yield ma
+        # are used with Python's re as given (callers pass unescaped
+        # class names, lookaheads, space-separated descriptors). Matching
+        # runs on the class_methods() rows (natively narrowed to the names
+        # with the method pattern's literal prefix); a MethodAnalysis is
+        # made only for a match.
+        classes = self._method_candidates(classname, methodname)
+        if classes is None:
+            classes = self._matching_classes(classname)
+        # Each pattern is compiled at the first re.match() androguard makes
+        # with it (`and` short-circuits), so a bad one raises at the same
+        # point.
+        yield from self._find_in(classes, methodname, descriptor, accessflags, no_external)
+
+    def _method_candidates(self, classname, methodname):
+        """For find_methods(): [(position, name, is_external)], ascending,
+        of the classes whose name re.match()es `classname` and that have a
+        method whose name starts with `methodname`'s literal prefix (no
+        other class can yield a match), or None to look at every class
+        matching `classname`. Patterns that don't compile are left to the
+        plain loop, which raises where androguard's does."""
+        if not (isinstance(methodname, str) and isinstance(classname, str)):
+            return None
+        try:
+            prefix = _literal_prefix(methodname)
+            match = _compiled(classname).match
+        except re.error:
+            return None
+        if not prefix:
+            return None
+        try:
+            cands = self._rs._classes_with_method_prefix(prefix)
+        except UnicodeError:
+            return None
+        cprefix = _literal_prefix(classname)
+        return [t for t in self._rs._classes_at(cands) if t[1].startswith(cprefix) and match(t[1])]
+
+    def _find_in(self, classes, methodname, descriptor, accessflags, no_external):
+        mm = dm = am = None
+        prefix = None
+        if isinstance(methodname, str):
+            try:
+                prefix = _literal_prefix(methodname) or None
+            except re.error:
+                prefix = None
+        rs = self._rs
+        for _i, cname, _ext in classes:
+            try:
+                rows = rs.class_methods(cname, prefix)
+            except UnicodeError:
+                rows = rs.class_methods(cname)
+            for r in rows or ():
+                external = r[4]
+                if no_external and external:
+                    continue
+                if mm is None:
+                    mm = _matcher(methodname)
+                if not mm(r[1]):
+                    continue
+                if dm is None:
+                    dm = _matcher(descriptor)
+                if not dm(r[2]):
+                    continue
+                if am is None:
+                    am = _matcher(accessflags)
+                if am("" if external else r[3]):
+                    yield MethodAnalysis(self, cname, r[0], r[1], r[2], r, _row_key(r, cname),
+                                         r[6] if len(r) > 6 else None)
 
     # androguard_rs extensions (not androguard API): whole-APK queries served
     # natively, for callers that would otherwise walk every instruction.
@@ -924,7 +1075,7 @@ class ARSCParser(_Loud):
     def get_resolved_res_configs(self, rid, config=None):
         if config is not None:
             _gap("ARSCParser", "get_resolved_res_configs(config=...)")
-        return self._r.get_resolved_res_configs(rid)
+        return self._r.get_resolved_res_configs(rid, _arscconfig.from_bytes)
 
     def get_resource_xml_name(self, r_id, package=None):
         return self._r.get_resource_xml_name(r_id, package)

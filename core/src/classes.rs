@@ -7,7 +7,7 @@ use std::sync::{Arc, OnceLock};
 use anyhow::{Result, anyhow, bail};
 use rustc_hash::FxHashMap;
 
-use crate::dex::Dex;
+use crate::dex::{ClassData, ClassDef, Dex};
 use crate::maplist::{ag_uleb128, skip_encoded_value};
 use crate::py_printable::PRINTABLE;
 use crate::render::AgResolver;
@@ -342,6 +342,13 @@ fn body(dex: &Dex, r: &AgResolver, off: u32, statics: &[u32]) -> Result<Body> {
             (field_flags(f.access_flags), fname, ftype)
         })
         .collect();
+    let inits = static_inits(dex, r, &data, statics);
+    Ok(Body { methods: Arc::new(methods), fields: Arc::new(fields), inits })
+}
+
+/// The initial values of a class_data's leading static fields, written by
+/// the class_defs whose static_values_off are `statics` (see `body`).
+fn static_inits(dex: &Dex, r: &AgResolver, data: &ClassData, statics: &[u32]) -> Arc<Vec<Value>> {
     // Last writer wins per field: walk the writers backwards, and let each
     // fill only the fields no later writer reached, so every field is
     // written once whatever the number of classes.
@@ -367,8 +374,23 @@ fn body(dex: &Dex, r: &AgResolver, off: u32, statics: &[u32]) -> Result<Body> {
             buf.extend(values[done..].iter().cloned());
         }
     }
-    let inits = inits.unwrap_or_else(|| Arc::new(buf));
-    Ok(Body { methods: Arc::new(methods), fields: Arc::new(fields), inits })
+    inits.unwrap_or_else(|| Arc::new(buf))
+}
+
+/// `class_info(dex, i).inits` (and its errors), without rendering the
+/// class's members.
+pub fn class_inits(dex: &Dex, i: usize) -> Result<Arc<Vec<Value>>> {
+    let (cd, _, has_data) = class_def_checked(dex, i)?;
+    if !has_data {
+        return Ok(Default::default());
+    }
+    if dex.memo.bodies.contains_key(&cd.class_data_off) {
+        return Ok(class_info(dex, i)?.inits);
+    }
+    let data = dex.class_data(cd.class_data_off)?;
+    let sv = cd.static_values_off;
+    let statics: &[u32] = if sv != 0 { &[sv] } else { &[] };
+    Ok(static_inits(dex, &AgResolver { dex }, &data, statics))
 }
 
 fn static_values(r: &AgResolver, off: u32) -> Result<Vec<Value>> {
@@ -380,6 +402,38 @@ fn static_values(r: &AgResolver, off: u32) -> Result<Vec<Value>> {
         values.push(read_value(r, &mut pos)?);
     }
     Ok(values)
+}
+
+/// The checks `class_info` makes on class_def `i` itself (its errors,
+/// in its order): the class_def, its interfaces' type indices and whether
+/// it has a class_data.
+pub fn class_def_checked(dex: &Dex, i: usize) -> Result<(ClassDef, Vec<u32>, bool)> {
+    let cd = dex.class_def(i)?;
+    let interfaces = dex.type_list(cd.interfaces_off)?;
+    if cd.annotations_off != 0 && !dex.declared.has_annotations_dir {
+        bail!("annotations_off {:#x} set but the map list has no annotations directory", cd.annotations_off);
+    }
+    let has_data = dex.has_class_data(cd.class_data_off);
+    let sv = cd.static_values_off;
+    if sv != 0 {
+        match dex.encoded_array_declared(sv) {
+            None => bail!("static_values_off {sv:#x} set but the map list has no encoded_array section"),
+            Some(false) if has_data => bail!("static_values_off {sv:#x} is not declared in the map list"),
+            _ => {}
+        }
+    }
+    Ok((cd, interfaces, has_data))
+}
+
+/// class_def `i` and its parsed class_data (None without one), failing
+/// exactly where `class_info` does, without rendering any text.
+pub fn class_data_checked(dex: &Dex, i: usize) -> Result<(ClassDef, Option<ClassData>)> {
+    let (cd, _, has_data) = class_def_checked(dex, i)?;
+    if !has_data {
+        return Ok((cd, None));
+    }
+    let data = dex.class_data(cd.class_data_off)?;
+    Ok((cd, Some(data)))
 }
 
 /// class_info for class_def `i`, following androguard's
@@ -396,20 +450,9 @@ fn static_values(r: &AgResolver, off: u32) -> Result<Vec<Value>> {
 /// as in androguard.
 pub fn class_info(dex: &Dex, i: usize) -> Result<ClassInfo> {
     let r = AgResolver { dex };
-    let cd = dex.class_def(i)?;
-    let interfaces = dex.type_list(cd.interfaces_off)?.into_iter().map(|t| r.type_name(t)).collect();
-    if cd.annotations_off != 0 && !dex.declared.has_annotations_dir {
-        bail!("annotations_off {:#x} set but the map list has no annotations directory", cd.annotations_off);
-    }
-    let has_data = dex.has_class_data(cd.class_data_off);
+    let (cd, ifaces, has_data) = class_def_checked(dex, i)?;
+    let interfaces = ifaces.into_iter().map(|t| r.type_name(t)).collect();
     let sv = cd.static_values_off;
-    if sv != 0 {
-        match dex.encoded_array_declared(sv) {
-            None => bail!("static_values_off {sv:#x} set but the map list has no encoded_array section"),
-            Some(false) if has_data => bail!("static_values_off {sv:#x} is not declared in the map list"),
-            _ => {}
-        }
-    }
     let body = if !has_data {
         Arc::new(Body { methods: Default::default(), fields: Default::default(), inits: Default::default() })
     } else if let Some((statics, cell)) = dex.memo.bodies.get(&cd.class_data_off) {

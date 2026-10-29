@@ -64,14 +64,17 @@ def method_shape(em) -> dict:
         insns = list(em.get_instructions())
     except Exception as e:  # noqa: BLE001
         return {"error": (type(e).__name__, str(e))}
-    pos = {id(i): n for n, i in enumerate(insns)}
+    # By equality: androguard's lookups return the listed objects
+    # themselves (compared by identity); androguard_rs's return handles
+    # equal to them.
+    pos = {i: n for n, i in enumerate(insns)}
 
     def where(f, *args):
         try:
             v = f(*args)
         except Exception as e:  # noqa: BLE001
             return ("raise", type(e).__name__, str(e))
-        return ("pos", pos.get(id(v), "foreign" if v is not None else None))
+        return ("pos", pos.get(v, "foreign") if v is not None else None)
 
     offs = [off for off, _ in em.get_instructions_idx()]
     n = len(insns)
@@ -88,6 +91,8 @@ def method_shape(em) -> dict:
         "insns": [insn_shape(i) for i in insns],
         "offs": offs,
         "lookups": lookups,
-        "same_objects": [a is b for a, b in zip(insns, again)] == [True] * n,
+        # asking again gives the same instructions (androguard: the same
+        # objects; androguard_rs: equal handles with equal hashes)
+        "same_objects": [a == b and hash(a) == hash(b) for a, b in zip(insns, again)] == [True] * n,
         "list_type": type(em.get_instructions()).__name__,
     }

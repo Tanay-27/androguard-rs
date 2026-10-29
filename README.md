@@ -18,10 +18,12 @@ cross-reference, which adds up to tens of times the DEX size in RAM. Large
 multi-DEX apps can need many GiB for `AnalyzeAPK`.
 
 androguard-rs reads the DEX bytes in place, decodes instructions only when
-asked, and stores cross-references as flat integer arrays. The Python
-objects androguard callers walk (`ClassAnalysis`, `MethodAnalysis`,
-`EncodedMethod`, `Instruction`, ...) are created lazily and kept in small
-bounded caches, so memory stays close to the size of the DEX files
+asked, and stores cross-references as flat integer arrays. Rust owns all of
+that data. The Python objects androguard callers walk (`ClassAnalysis`,
+`MethodAnalysis`, `EncodedMethod`, `Instruction`, ...) are per-query
+handles: each is made for the query that returns it, holds only the native
+index and a few integer keys, and nothing is kept on the Python side
+between queries, so memory stays close to the size of the DEX files
 themselves. Run `spike stats <apk>` (below) to measure load time and
 counts on your own APKs.
 
@@ -33,7 +35,7 @@ Prebuilt wheels (Linux x86_64/aarch64 manylinux, macOS arm64; abi3, Python
 `SHA256SUMS` file:
 
 ```sh
-gh release download v0.1.1 -R Tanay-27/androguard-rs -p '*.whl' -p SHA256SUMS
+gh release download v0.1.2 -R Tanay-27/androguard-rs -p '*.whl' -p SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
 pip install androguard_rs-*.whl
 ```
@@ -50,17 +52,35 @@ are lxml elements, as in androguard). androguard itself is not needed.
 
 ## Usage
 
-Swap the imports:
+`androguard_rs` has androguard 4.1.3's module layout: every module path
+androguard has that is provided here exists with `androguard` renamed to
+`androguard_rs`, so switching is `androguard` → `androguard_rs` in the
+imports:
 
 | androguard 4.1.3 | androguard-rs |
 |---|---|
 | `from androguard.misc import AnalyzeAPK` | `from androguard_rs.misc import AnalyzeAPK` |
-| `from androguard.core.apk import APK` | `from androguard_rs.apk import APK` |
-| `from androguard.core.axml import AXMLPrinter` | `from androguard_rs.axml import AXMLPrinter` |
-| `from androguard.core.dex import DEX, Instruction11n, ...` | `from androguard_rs.dex import DEX, Instruction11n, ...` |
-| `from androguard.core.analysis.analysis import Analysis` | `from androguard_rs.analysis import Analysis` |
+| `from androguard.core.apk import APK, FileNotPresent` | `from androguard_rs.core.apk import APK, FileNotPresent` |
+| `from androguard.core.axml import AXMLPrinter, ARSCParser, ARSCResTableConfig` | `from androguard_rs.core.axml import AXMLPrinter, ARSCParser, ARSCResTableConfig` |
+| `from androguard.core.dex import DEX, EncodedMethod, Instruction11n, ...` | `from androguard_rs.core.dex import DEX, EncodedMethod, Instruction11n, ...` |
+| `from androguard.core.analysis.analysis import Analysis` | `from androguard_rs.core.analysis.analysis import Analysis` |
+| `from androguard.core import api_specific_resources` | `from androguard_rs.core import api_specific_resources` (`load_permissions`, `load_permission_mappings`) |
+| `from androguard.core.androconf import load_api_specific_resource_module` | `from androguard_rs.core.androconf import load_api_specific_resource_module` |
 | `from androguard.util import set_log` | `from androguard_rs.util import set_log` (no-op) |
-| `androguard.core.api_specific_resources.load_permission_mappings` | `androguard_rs.api_specific_resources.load_permission_mappings` |
+| `from androguard.decompiler import decompile` | `import androguard_rs.decompiler` (import only, see below) |
+
+The short paths `androguard_rs.apk`, `.dex`, `.analysis`, `.axml` and
+`.api_specific_resources` are the same module objects as their `core`
+paths, so classes are identical whichever path imported them
+(`python/tests/test_layout.py`).
+
+`androguard_rs.decompiler` is import-only: the decompiler is not provided
+(any name from it raises `NotImplementedError`). Importing it does what
+importing `androguard.decompiler` does as a side effect,
+`sys.setrecursionlimit(5000)` (so does `androguard_rs.misc`, as
+`androguard.misc` does), so code that drops its decompiler use but keeps
+the import keeps androguard's recursion limit, which decides where deeply
+nested DEX values raise `RecursionError`.
 
 ```python
 from androguard_rs.misc import AnalyzeAPK
@@ -89,12 +109,35 @@ for ca, ma in dx.search_instruction_text(["ljavax/net/ssl/"]):   # lower-cased n
 Both return exactly what the equivalent walk over `get_classes()` /
 `get_methods()` / `get_instructions_idx()` returns, in the same order.
 
+One more on `DEX`, `find_methods_referencing(names, rules,
+include_unreadable=True)`, returns in one native pass the EncodedMethods,
+in `get_encoded_methods()` order, whose name is in `names` or one of whose
+instructions passes a rule `(opcode names or None, "endswith" | "contains",
+text)` on its `get_output()` (or whose code can't be disassembled): the
+methods a full walk with those tests would find, so a caller narrows its
+walk to them and runs its own checks on those only. Feature-detect it to
+keep code runnable on androguard:
+
+```python
+rules = [(("invoke-virtual",), "contains", "Ljava/lang/String;->equals")]
+for vm in d:
+    if hasattr(vm, "find_methods_referencing"):
+        methods = vm.find_methods_referencing(["checkServerTrusted"], rules)
+    else:
+        methods = vm.get_encoded_methods()     # androguard: walk them all
+    for m in methods:
+        ...
+```
+
+`python/tests/test_dexobj_parity.py` checks all three extensions against
+the equivalent walk over androguard's objects.
+
 Building the analysis yourself works as in androguard:
 
 ```python
-from androguard_rs.apk import APK
-from androguard_rs.dex import DEX
-from androguard_rs.analysis import Analysis
+from androguard_rs.core.apk import APK
+from androguard_rs.core.dex import DEX
+from androguard_rs.core.analysis.analysis import Analysis
 
 a = APK("app.apk")
 dx = Analysis()
@@ -105,7 +148,10 @@ dx.create_xref()
 
 `AXMLPrinter(raw).get_xml()` / `get_xml_obj()` and
 `APK.get_android_resources()` (an `ARSCParser` backed by
-`androguard_rs.Resources`) behave as androguard's.
+`androguard_rs.Resources`) behave as androguard's;
+`get_resolved_res_configs(rid)` returns androguard's own
+`ARSCResTableConfig` objects (androguard 4.1.3's class, built from the same
+bytes: attributes, `repr()`, `==`, `hash()` and methods all equal).
 
 ### Native API
 
@@ -133,21 +179,23 @@ as plain Python values:
 
 Signatures look like `Lcom/foo/Bar;->baz(ILjava/lang/String;)V`.
 
+Tuning: `ANDROGUARD_RS_CACHE` (`noatoms`, `spans`, `text`, `lru=N`,
+comma-separated, read when the index is built) changes what the native
+index keeps between queries; the default is recommended. See
+[`docs/dex-api-map.md`](docs/dex-api-map.md).
+
 `androguard_rs.Resources(arsc_bytes)` (or `Resources.from_apk(path)`)
 provides `ARSCParser`'s `get_packages_names()`, `get_public_resources()`,
 `get_resolved_strings()`, `get_resolved_res_configs()`,
 `get_resource_xml_name()`, `get_string()` and `get_string_resources()`,
 with androguard's results and errors (as `ResourcesError`).
 
-One extension that androguard doesn't have:
-`androguard_rs.dex.DEX.get_ssl_candidate_methods()` returns the methods that
-may implement or weaken TLS validation (named `checkServerTrusted`, `verify`
-or `onReceivedSslError`, or using `AllowAllHostnameVerifier`,
-`ALLOW_ALL_HOSTNAME_VERIFIER` or `SSLCertificateSocketFactory.getInsecure`).
-It is a cheap superset to run slower per-method checks on.
-
 More detail:
 
+- [`docs/dex-api-map.md`](docs/dex-api-map.md): `DEX()`, `Analysis` and
+  the per-DEX objects: load errors step by step, `RecursionError` depth,
+  ordering, the per-query handles and their identity, and the
+  `ANDROGUARD_RS_CACHE` tuning knobs;
 - [`docs/apk-api-map.md`](docs/apk-api-map.md): `APK`, `AXMLPrinter`,
   `AnalyzeAPK`, the zip reader and the DEX load order;
 - [`docs/instruction-api.md`](docs/instruction-api.md): the `Instruction`
@@ -158,15 +206,45 @@ More detail:
 
 ## Differences from androguard 4.1.3
 
-- **Loading fails as androguard's does.** `AnalyzeAPK` raises on a DEX that
-  androguard's `DEX()` header checks reject (short file, wrong or
-  byte-swapped endian tag, wrong magic, bad Adler-32 checksum, wrong header
-  size, too many type/proto ids) and on the first method `Analysis.add()`
-  can't disassemble, in androguard's order and with its exception.
+- **Loading fails as androguard's does** (this is parity, not a
+  difference). `AnalyzeAPK`, `DEX()`, `Analysis.add()` and `create_xref()`
+  raise what androguard 4.1.3's raise, at the same step and with the same
+  type, `args` and `str()`: every `DEX()` header check (short file, wrong
+  or byte-swapped endian tag, wrong magic, bad Adler-32 checksum, wrong
+  header size, too many type/proto ids), then whatever its parse of the
+  map list and each section raises (`struct.error` for a short read,
+  `ValueError` for an unknown map type, `KeyError` for a missing section
+  or undeclared type list, `AttributeError` for a bad proto or missing
+  static values, hidden-API flag enum errors), what `Analysis.add()` raises
+  (the first method it can't disassemble, `InvalidInstruction`; try
+  handlers it can't match; code cut to an odd length), and what
+  `create_xref()` raises, in androguard's order across DEX files.
+  `RecursionError` from nested encoded values comes at the nesting depth
+  androguard's would, given the caller's stack and recursion limit.
+  `core/src/agload.rs` follows androguard's steps over the raw bytes;
+  [`docs/dex-api-map.md`](docs/dex-api-map.md) lists them.
   `AnalyzeAPK(..., tolerant=True)` / `Apk(path, tolerant=True)` (not
   androguard) instead skip a DEX rejected with "Header too small" or "Wrong
   endian tag" (listed in `skipped_dex()`) and raise `InvalidInstruction`
   only when the undecodable method's code is asked for.
+- **Per-query handles** (intentional, for memory): objects from different
+  queries for the same thing are equal (`==`, same `hash()`), so sets and
+  dicts dedupe as with androguard's single objects, but they are not the
+  same object (`is` differs across queries). `EncodedMethod` and
+  `EncodedField` compare by (DEX, class_data offset, position), matching
+  androguard's one shared object per class_data entry. A payload's
+  `add_note()` notes stay on the one object they were added to. See
+  [`docs/dex-api-map.md`](docs/dex-api-map.md).
+- **Deep array types in `get_information()`**: androguard's recursive
+  `get_type()` raises `RecursionError` for an array type nested deeper than
+  the remaining recursion depth (just under 1,000 levels at Python's
+  default limit, 5,000 after importing `misc`); the native port returns the
+  type. DEX caps array dimensions at 255, so only
+  malformed files differ.
+- **One intentional difference in loading**: a string_data_item with no
+  NUL terminator before the end of the file makes androguard 4.1.3's
+  `read_null_terminated_string` loop forever (its list of empty reads grows
+  until memory runs out). androguard-rs raises `MemoryError()` at once.
 - **`get_certificates_v1()`** returns each v1 signature's PKCS#7 file
   unverified (androguard returns the signer certificate only for a
   signature that verifies); `get_certificates_v2/v3()` return DER `bytes`
@@ -176,11 +254,13 @@ More detail:
   stable between runs. Xref results are sets in both.
 - **Exception types**: parse failures raise `androguard_rs.AxmlError`,
   `ApkError`/`BrokenAPKError` or `ResourcesError` where androguard raises
-  assorted internal errors.
+  assorted internal errors (a signing block cut short raises androguard's
+  own `struct.error`).
 - **Static values that are arrays or annotations**: androguard prints an
   object `repr` with a memory address; androguard-rs prints `at 0x0>`.
-- **Not implemented**: the decompiler, sessions, and androguard APIs outside
-  the ones above. An unimplemented attribute of a supported object raises
+- **Not implemented**: the decompiler (`androguard_rs.decompiler` is
+  import-only), sessions, `get_resolved_res_configs(rid, config=...)` with a
+  config filter, and androguard APIs outside the ones above. An unimplemented attribute of a supported object raises
   `NotImplementedError` naming it (counted in `GAPS` / `APK_GAPS`); one
   androguard's object doesn't have either raises `AttributeError`, as in
   androguard.
@@ -232,6 +312,11 @@ limits.
   method, instruction, xref, field, manifest query, zip entry, XML file and
   resource of each listed APK is compared exactly against androguard's
   `AnalyzeAPK`, `APK`, `AXMLPrinter` and `ARSCParser`.
+- **Differential load fuzzing** (`scripts/load_difffuzz.py`): mutants of
+  real DEX files (map entries, header fields, sections, code items, random
+  bytes, truncation; some loaded with a second DEX) through `DEX()`,
+  `Analysis.add()` and `create_xref()` on both sides, comparing
+  accept/reject and the exception's stage, type, `args` and `str()`.
 - **Differential fuzzing** of the decoder (mutated method bytecode vs
   androguard's `LinearSweepAlgorithm`, errors included), of string decoding
   (random bytes vs the `mutf8` C extension) and of resource tables (mutants
@@ -257,7 +342,7 @@ checks). Targets in `fuzz/fuzz_targets/`:
 
 | Target | Input |
 |---|---|
-| `dex_pipeline` | arbitrary bytes as a DEX, through every query and the per-DEX views |
+| `dex_pipeline` | arbitrary bytes as a DEX, through androguard's load steps (`agload`), every query and the per-DEX views |
 | `decode` | arbitrary method code; also checks the decoders agree on validity and instruction boundaries |
 | `text` | string decoding and text transforms |
 | `apk` | arbitrary zips through the bounded loader, index and resources |
@@ -296,7 +381,7 @@ seeds.
 | `spike/` | CLI: stats, parity dumps, mutation fuzzer |
 | `fuzz/` | cargo-fuzz targets |
 | `vendor/dex-bytecode/` | instruction decoder, vendored from androguard/dex-bytecode and modified for 4.1.3 parity (see its `VENDORED.md`) |
-| `scripts/` | androguard-side dumps, golden generators, fuzz seed generators, parity driver |
+| `scripts/` | androguard-side dumps, golden generators, fuzz seed generators, parity driver, load differential fuzzer |
 
 ```sh
 cargo build --release
@@ -306,16 +391,14 @@ cargo test --workspace --exclude androguard-rs-py --release
 
 ## Known gaps
 
-- A DEX that androguard's `DEX()` rejects past its header checks (a broken
-  map list or item), or whose try/catch tables make `Analysis.add()` fail,
-  isn't failed the same way.
-- Id tables are read from the header and string_data offsets aren't
-  checked against the map list (androguard reads both through the map);
-  they agree on every valid DEX.
+- Crafted DEX files androguard loads but whose members can't be named
+  (out-of-range method/type/string indices, undecodable or colliding
+  placeholder names such as `AG:IS: invalid string`): androguard keeps one
+  object per item; the index keys methods and classes by name, so some
+  xrefs and facade lookups of those members differ. Load errors are not
+  affected, and real APKs don't have such members.
 - Field read/write and `new-instance`/`const-class` cross-references are
   not indexed as xrefs.
-- A method whose code runs past the end of the DEX is skipped; androguard
-  reads what's there.
 
 ## License
 

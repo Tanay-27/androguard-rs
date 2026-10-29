@@ -26,6 +26,7 @@ from androguard.misc import AnalyzeAPK  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "compat"))
 import androguard_compat as compat  # noqa: E402
 
+from arsc_config_view import tree_view  # noqa: E402
 from resource_refs import r_field_ids, resource_refs  # noqa: E402
 
 APKS = [p for p in os.environ.get("PARITY_APKS", "").split(os.pathsep) if p]
@@ -196,8 +197,14 @@ def test_arsc_shim(pair, which):
     assert ours.get_resolved_strings() == ag.get_resolved_strings()
     for rid in list(ag.resource_values)[:500]:
         assert ours.get_resource_xml_name(rid) == ag.get_resource_xml_name(rid)
-        exp = [(c._get_tuple(), v) for c, v in ag.get_resolved_res_configs(rid)]
-        assert ours.get_resolved_res_configs(rid) == exp
+        assert_configs_equal(ours.get_resolved_res_configs(rid), ag.get_resolved_res_configs(rid))
+
+
+def assert_configs_equal(ours, ag):
+    """get_resolved_res_configs() results are equal: values, and config
+    objects equal (==) and alike in every attribute and method."""
+    assert ours == ag
+    assert tree_view(ours) == tree_view(ag)
 
 
 def test_native_whole_apk_queries(pair):

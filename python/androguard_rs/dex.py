@@ -3,10 +3,10 @@ objects ``EncodedMethod.get_instructions()``, ``get_instruction()`` and
 ``get_code().get_bc().get_instructions()`` return in ``androguard_rs``'s
 facade (``androguard_rs._analysis``).
 
-Swap the import and ``isinstance`` checks keep working::
+Rename the import and ``isinstance`` checks keep working::
 
     # from androguard.core.dex import Instruction, Instruction11n, Instruction21s, Instruction31i
-    from androguard_rs.dex import Instruction, Instruction11n, Instruction21s, Instruction31i
+    from androguard_rs.core.dex import Instruction, Instruction11n, Instruction21s, Instruction31i
 
 Every class androguard 4.1.3 has for DEX bytecode is here under the same
 name, with the same public methods and the same format fields (``A``,
@@ -28,12 +28,14 @@ as a string index whatever the opcode); they raise NotImplementedError and
 are counted in ``GAPS``. Unknown attributes raise AttributeError, as in
 androguard.
 
-Objects are built per method, on demand, from one native call
-(``androguard_rs.Apk.instructions(sig)``); fields are unpacked on first
-access. Not reproduced: ``repr()`` (androguard's default object repr shows
-a memory address, and this module's name), and notes added with
-``add_note()`` on a payload last only as long as the method's instruction
-list stays in the facade's cache.
+Instruction objects are handles made per query (each
+``get_instructions()`` makes new ones, from one native call): the method's
+bytes and the instruction's offset, nothing else; the same instruction
+from two queries compares and hashes equal but isn't the same object (as
+androguard's cached ones are), and a payload's ``add_note()`` notes stay on
+the object they were added to. Format fields are unpacked on first access.
+Not reproduced: ``repr()`` (androguard's default object repr shows a memory
+address, and this module's name).
 """
 
 from __future__ import annotations
@@ -43,7 +45,10 @@ import struct
 from collections import Counter
 from enum import IntEnum
 
-from . import _native
+import sys as _sys
+
+from . import _agerr, _native
+from ._agerr import HiddenApiClassDataItem, TypeMapItem  # noqa: F401
 
 InvalidInstruction = _native.InvalidInstruction
 
@@ -109,9 +114,55 @@ def get_kind(cm, kind: int, value: int):
 
 # ── Instruction ───────────────────────────────────────────────────────────────
 
-# A row from androguard_rs.Apk.instructions(): (offset, op_value, length,
-# raw_len, output, kind).
-_OFF, _OP, _LEN, _RAWLEN, _OUT, _KINDTXT = range(6)
+# An instruction's `_code` is its method's code (an `_Insns`) and `_row` its
+# byte offset in the insns. An instruction's text (get_output() and the
+# resolved reference) is decoded natively each time it is asked for.
+_OUT, _KINDTXT = 0, 1
+
+
+class _Insns:
+    """One method's code, shared by the Instruction handles one query made:
+    `_rs`, `_d`, `_co` (the native index, DEX number and code_off) and
+    `_plen` (payloads only: {offset: len(get_raw())}), set natively; `_raw`
+    (the insns, read when format fields are first unpacked) and `_fd`
+    ({offset: unpacked format fields}). An instruction's text is decoded
+    each time it is asked for, as androguard formats it on each
+    get_output() call."""
+
+    __slots__ = ("_rs", "_d", "_co", "_raw", "_plen", "_fd")
+
+    def _text(self, off: int):
+        return self._rs._insn_text(self._d, self._co, off)
+
+    def _kind(self, off: int):
+        return self._rs._insn_kind(self._d, self._co, off)
+
+    def _fields(self, ins, length: int) -> dict:
+        fd = self._fd
+        if fd is None:
+            fd = self._fd = {}
+        off = ins._row
+        f = fd.get(off)
+        if f is None:
+            raw = self._raw
+            if raw is None:
+                raw = self._raw = self._rs._code_bytes(self._d, self._co)
+            f = fd[off] = ins._unpack(raw[off:off + length])
+        return f
+
+
+def _at(insns: tuple, idx):
+    """`insns[idx]` as on androguard's cached instruction list (the
+    instructions are kept in a tuple): a slice is a list, and errors read
+    as a list's."""
+    try:
+        v = insns[idx]
+    except IndexError:
+        raise IndexError("list index out of range") from None
+    except TypeError:
+        raise TypeError(f"list indices must be integers or slices, not {type(idx).__name__}") from None
+    return list(v) if isinstance(idx, slice) else v
+
 
 _NOT_IMPLEMENTED = ("cm", "CM")
 
@@ -119,7 +170,10 @@ _NOT_IMPLEMENTED = ("cm", "CM")
 class Instruction:
     """androguard.core.dex.Instruction."""
 
-    __slots__ = ("_code", "_row", "_f")
+    # _code: the method's insns (_Insns); _row: byte offset in them; _name,
+    # _op: the opcode's name and value (the byte at _row; shared objects).
+    # Unpacked format fields are kept in _code.
+    __slots__ = ("_code", "_row", "_name", "_op")
 
     length = 0
     #: Format fields, unpacked from the bytes on first access.
@@ -130,28 +184,37 @@ class Instruction:
     def _unpack(self, raw: bytes) -> dict:
         return {}
 
-    def __getattr__(self, attr):
-        if attr in self._FIELDS:
-            f = self._f
-            if f is None:
-                row = self._row
-                off = row[_OFF]
-                f = self._f = self._unpack(self._code[off:off + row[_RAWLEN]])
-            return f[attr]
-        if attr == "OP":
-            return self._row[_OP]
-        if attr in _NOT_IMPLEMENTED:
-            _gap(type(self).__name__, attr)
-        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{attr}'")
+    def _fields(self) -> dict:
+        return self._code._fields(self, self.length)
+
+    # A handle: the same instruction (its method's code, its offset) from
+    # any query compares and hashes equal.
+    def __eq__(self, other):
+        if not isinstance(other, (Instruction, _Payload)):
+            return NotImplemented
+        a, b = self._code, other._code
+        return self._row == other._row and a._co == b._co and a._d == b._d and a._rs is b._rs
+
+    def __hash__(self):
+        c = self._code
+        return hash((id(c._rs), c._d, c._co, self._row))
+
+    # Format fields (`A`, `BBBB`, ...) are properties made from _FIELDS
+    # (see _add_field_properties), `cm`/`CM` raise NotImplementedError,
+    # anything else is a plain AttributeError: no __getattr__, so attribute
+    # and method lookups on instructions stay on CPython's fast path.
+    @property
+    def OP(self) -> int:
+        return self._op
 
     def get_kind(self) -> int:
-        return DALVIK_OPCODES_FORMAT[self._row[_OP]][1][1]
+        return DALVIK_OPCODES_FORMAT[self._op][1][1]
 
     def get_name(self) -> str:
-        return _NAMES[self._row[_OP]]
+        return self._name
 
     def get_op_value(self) -> int:
-        return self._row[_OP]
+        return self._op
 
     def get_literals(self) -> list:
         return []
@@ -168,10 +231,10 @@ class Instruction:
         self.get_kind()
         if not self._HAS_REF:
             self.get_ref_kind()  # raises, as androguard's base class does
-        return self._row[_KINDTXT]
+        return self._code._kind(self._row)
 
     def get_output(self, idx: int = -1) -> str:
-        return self._row[_OUT]
+        return self._code._text(self._row)[_OUT]
 
     def get_operands(self, idx: int = -1) -> list:
         return []
@@ -199,7 +262,7 @@ class Instruction:
 
 
 def _kind_tuple(self, ref):
-    return (self.get_kind() + Operand.KIND, ref, self._row[_KINDTXT])
+    return (self.get_kind() + Operand.KIND, ref, self._code._kind(self._row))
 
 
 class _Kinded(Instruction):
@@ -209,7 +272,7 @@ class _Kinded(Instruction):
 
     def get_string(self) -> str:
         self.get_kind()
-        return self._row[_KINDTXT]
+        return self._code._kind(self._row)
 
     def get_raw_string(self) -> str:
         _gap(type(self).__name__, "get_raw_string")
@@ -759,26 +822,29 @@ class _Payload:
     """Shared plumbing of androguard's three payload classes (which aren't
     Instruction subclasses and share no base)."""
 
-    __slots__ = ("_code", "_row", "_f", "notes")
+    __slots__ = ("_code", "_row", "_notes")
 
     OP = 0
     _FIELDS: tuple = ()
     format_general_size = 0
 
-    def __getattr__(self, attr):
-        if attr in self._FIELDS:
-            f = self._f
-            if f is None:
-                row = self._row
-                off = row[_OFF]
-                f = self._f = self._unpack(self._code[off:off + row[_RAWLEN]])
-            return f[attr]
-        if attr == "notes":
-            self.notes = []
-            return self.notes
-        if attr in _NOT_IMPLEMENTED:
-            _gap(type(self).__name__, attr)
-        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{attr}'")
+    def _fields(self) -> dict:
+        return self._code._fields(self, self._code._plen[self._row])
+
+    __eq__ = Instruction.__eq__
+    __hash__ = Instruction.__hash__
+
+    @property
+    def notes(self) -> list:
+        try:
+            return self._notes
+        except AttributeError:
+            n = self._notes = []
+            return n
+
+    @notes.setter
+    def notes(self, value) -> None:
+        self._notes = value
 
     def add_note(self, msg: str) -> None:
         self.notes.append(msg)
@@ -816,7 +882,7 @@ class FillArrayData(_Payload):
         return self.data
 
     def get_output(self, idx: int = -1) -> str:
-        return self._row[_OUT]
+        return self._code._text(self._row)[_OUT]
 
     def get_operands(self, idx: int = -1):
         if isinstance(self.get_data(), bytearray):
@@ -859,7 +925,7 @@ class SparseSwitch(_Payload):
         return self.targets
 
     def get_output(self, idx: int = -1) -> str:
-        return self._row[_OUT]
+        return self._code._text(self._row)[_OUT]
 
     def get_operands(self, idx: int = -1):
         return []
@@ -902,7 +968,7 @@ class PackedSwitch(_Payload):
         return self.targets
 
     def get_output(self, idx: int = -1) -> str:
-        return self._row[_OUT]
+        return self._code._text(self._row)[_OUT]
 
     def get_operands(self, idx: int = -1):
         return []
@@ -922,6 +988,34 @@ class PackedSwitch(_Payload):
 
     def get_raw(self) -> bytes:
         return _2Hi.pack(self.ident, self.size, self.first_key) + b''.join(_l.pack(i) for i in self.targets)
+
+
+def _field_property(name: str) -> property:
+    return property(lambda self: self._fields()[name])
+
+
+def _not_implemented(name: str) -> property:
+    return property(lambda self: _gap(type(self).__name__, name))
+
+
+def _add_field_properties() -> None:
+    """Each instruction class's format fields as properties (unpacked from
+    its bytes on first access), and `cm`/`CM`, which aren't implemented."""
+    seen, todo = set(), [Instruction, _Payload]
+    while todo:
+        cls = todo.pop()
+        if cls in seen:
+            continue
+        seen.add(cls)
+        todo.extend(cls.__subclasses__())
+        for n in cls.__dict__.get("_FIELDS", ()):
+            setattr(cls, n, _field_property(n))
+    for cls in (Instruction, _Payload):
+        for n in _NOT_IMPLEMENTED:
+            setattr(cls, n, _not_implemented(n))
+
+
+_add_field_properties()
 
 
 # ── Opcode tables (androguard 4.1.3's DALVIK_OPCODES_FORMAT) ──────────────────
@@ -1024,48 +1118,45 @@ DALVIK_OPCODES_FORMAT = _table()
 DALVIK_OPCODES_PAYLOAD = {0x0100: [PackedSwitch], 0x0200: [SparseSwitch], 0x0300: [FillArrayData]}
 
 _NAMES = [DALVIK_OPCODES_FORMAT[op][1][0] for op in range(256)]
-_CLASSES = {op: e[0] for op, e in DALVIK_OPCODES_FORMAT.items()}
-_CLASSES.update({op: e[0] for op, e in DALVIK_OPCODES_PAYLOAD.items()})
+#: op -> (instruction class, name) (None for a payload), for the native
+#: handle construction.
+_CLASSES = {op: (e[0], _NAMES[op]) for op, e in DALVIK_OPCODES_FORMAT.items()}
+_CLASSES.update({op: (e[0], None) for op, e in DALVIK_OPCODES_PAYLOAD.items()})
 
 
-def _instructions(data) -> list:
-    """Instruction objects for one `androguard_rs.Apk.instructions()` result
-    ``(insns, rows)``, in order."""
-    code, rows = data
-    classes = _CLASSES
-    new = object.__new__
-    out = []
-    append = out.append
-    for row in rows:
-        o = new(classes[row[1]])
-        o._code = code
-        o._row = row
-        o._f = None
-        append(o)
-    return out
+def _handles(rs, d: int, code_off: int):
+    """The Instruction handles (a tuple) of the code_item at `code_off` in
+    DEX number `d` of `rs`, or None without one: made natively, without
+    their text, which is decoded when asked for."""
+    return rs._insn_handles(d, code_off, _Insns, _CLASSES)
 
 
 # ── DEX object model ──────────────────────────────────────────────────────────
 #
-# androguard 4.1.3's per-DEX objects (what a caller of DEX() gets and walks):
-# DEX, ClassDefItem, EncodedMethod, EncodedField, EncodedValue, DalvikCode and
-# DCode, served one class_def at a time from androguard_rs.Apk (dex_class(),
-# code_instructions(), ...). Nothing per DEX is built up front: get_classes()
-# is a list of light ClassDefItem objects (name only), a class's methods and
-# fields are fetched when first asked for and kept in a bounded per-DEX LRU,
-# and instructions in another. Objects compare (and hash) by what they stand
-# for: an EncodedMethod/EncodedField by its DEX and its class_data entry, so
-# one reached twice (or through a class_def sharing its class_data, or through
-# a MethodAnalysis) is "the same object" for sets and dicts, as androguard's
-# single objects are.
+# androguard 4.1.3's per-DEX objects (what DEX(), AnalyzeAPK's DEX list and
+# Analysis hand out): DEX, ClassDefItem, EncodedMethod, EncodedField,
+# EncodedValue, DalvikCode and DCode. Except the DEX, each is a handle made
+# for the query that returns it: its DEX's native index and integer keys
+# (class_def index; class_data offset and position; method_idx/field_idx,
+# access flags, code_off), and nothing else. Every method asks the index;
+# nothing is kept on the Python side, so walking every method twice makes
+# new handles twice (and decodes each method's instructions twice).
+#
+# Handles compare (and hash) by what they stand for: a ClassDefItem by its
+# DEX and class_def; an EncodedMethod/EncodedField by its DEX and its
+# class_data entry (androguard shares one ClassDataItem, and so one object
+# per member, among class_defs pointing at the same class_data), so the
+# same member reached by any route (get_methods(), get_encoded_methods(),
+# a lookup by descriptor, a MethodAnalysis) is "the same object" for sets
+# and dicts; an Instruction by its method's code and byte offset. They are
+# not the same objects (`is`), as androguard's are.
 #
 # Unknown attributes raise AttributeError, as androguard's objects do (callers
-# may probe with getattr/try, e.g. `ClassDefItem.XREFfrom`); each is counted in
-# NOTES.
+# probing an attribute with try/except AttributeError, e.g. `XREFfrom` on a
+# ClassDefItem, see the same); each is counted in NOTES.
 
-from collections import OrderedDict  # noqa: E402
 import re as _re  # noqa: E402
-import threading as _threading  # noqa: E402
+import weakref as _weakref  # noqa: E402
 
 #: attribute -> times it was asked for and raised AttributeError, as in
 #: androguard (informational).
@@ -1113,31 +1204,6 @@ class _Quiet:
         raise AttributeError(f"'{type(self).__name__}' object has no attribute '{attr}'")
 
 
-class _LRU:
-    """A small thread-safe LRU of computed values."""
-
-    __slots__ = ("_d", "_n", "_lock")
-
-    def __init__(self, n: int):
-        self._d = OrderedDict()
-        self._n = n
-        self._lock = _threading.Lock()
-
-    def get(self, key, make):
-        with self._lock:
-            v = self._d.get(key)
-            if v is not None:
-                self._d.move_to_end(key)
-                return v
-        v = make()
-        with self._lock:
-            v = self._d.setdefault(key, v)
-            self._d.move_to_end(key)
-            if len(self._d) > self._n:
-                self._d.popitem(last=False)
-        return v
-
-
 class ClassManager(_Quiet):
     """androguard's ClassManager, as far as `EncodedMethod.CM.vm` goes."""
 
@@ -1162,20 +1228,30 @@ class EncodedValue(_Quiet):
         return self.value
 
 
+def _code_insns(m):
+    """The Instruction handles of method handle `m`'s code (it has code)."""
+    return m._rs._insn_handles(m._d, m._code_off, _Insns, _CLASSES)
+
+
 class DCode(_Quiet):
-    """androguard's DCode for one method's code: get_instructions() is a
-    generator (an invalid method raises InvalidInstruction on the first
-    next()), get_instruction(idx, off), off_to_pos(), get_ins_off(),
-    get_raw(), get_length()."""
+    """androguard's DCode for one method's code (a handle on its method):
+    get_instructions() is a generator (an invalid method raises
+    InvalidInstruction on the first next()), get_instruction(idx, off),
+    off_to_pos(), get_ins_off(), get_raw(), get_length()."""
 
-    __slots__ = ("_load",)
+    __slots__ = ("_m",)
 
-    def __init__(self, load):
-        # load() -> (instructions, their byte offsets), from a bounded LRU.
-        self._load = load
+    def __init__(self, m: "EncodedMethod"):
+        self._m = m
+
+    def __eq__(self, other):
+        return isinstance(other, DCode) and self._m == other._m
+
+    def __hash__(self):
+        return hash(("DCode", self._m))
 
     def get_instructions(self):
-        yield from self._load()[0]
+        yield from _code_insns(self._m)
 
     def is_cached_instructions(self) -> bool:
         return True
@@ -1183,21 +1259,27 @@ class DCode(_Quiet):
     def get_instruction(self, idx: int, off=None):
         if off is not None:
             idx = self.off_to_pos(off)
-        return self._load()[0][idx]
+        m = self._m
+        if type(idx) is int and -(1 << 62) < idx < (1 << 62):
+            return m._rs._insn_at(m._d, m._code_off, idx, _Insns, _CLASSES)
+        return _at(_code_insns(m), idx)
 
     def off_to_pos(self, off: int) -> int:
+        m = self._m
+        if type(off) is int:
+            return m._rs._insn_pos(m._d, m._code_off, off)[1]
         from bisect import bisect_left
 
-        offs = self._load()[1]
+        offs = [i._row for i in _code_insns(m)]
         i = bisect_left(offs, off)
         return i if i < len(offs) and offs[i] == off else -1
 
     def get_ins_off(self, off: int):
-        from bisect import bisect_left
-
-        insns, offs = self._load()
-        i = bisect_left(offs, off)
-        return insns[i] if i < len(offs) and offs[i] == off else None
+        pos = self.off_to_pos(off)
+        if pos < 0:
+            return None
+        m = self._m
+        return m._rs._insn_at(m._d, m._code_off, pos, _Insns, _CLASSES)
 
     def get_raw(self) -> bytearray:
         buff = bytearray()
@@ -1210,72 +1292,47 @@ class DCode(_Quiet):
 
 
 class DalvikCode(_Quiet):
-    """androguard's DalvikCode: get_bc(), get_instruction(),
-    get_registers_size()."""
+    """androguard's DalvikCode (a handle on its method): get_bc(),
+    get_instruction(), get_registers_size()."""
 
-    __slots__ = ("_load", "_registers")
+    __slots__ = ("_m",)
 
-    def __init__(self, load, registers):
-        self._load = load
-        self._registers = registers
+    def __init__(self, m: "EncodedMethod"):
+        self._m = m
+
+    def __eq__(self, other):
+        return isinstance(other, DalvikCode) and self._m == other._m
+
+    def __hash__(self):
+        return hash(("DalvikCode", self._m))
 
     def get_bc(self) -> DCode:
-        return DCode(self._load)
+        return DCode(self._m)
 
     def get_instruction(self, idx: int, off=None):
-        return DCode(self._load).get_instruction(idx, off)
+        return DCode(self._m).get_instruction(idx, off)
 
     def get_registers_size(self) -> int:
-        return self._registers
-
-
-# Method rows from Apk.dex_class(): (class_name, name, descriptor,
-# access_flags, flags string, code_off, has_code, registers_size, method_idx).
-_M_CLS, _M_NAME, _M_DESC, _M_FLAGS, _M_FSTR, _M_CODE_OFF, _M_HAS_CODE, _M_REGS, _M_IDX = range(9)
-# Field rows: (class_name, name, descriptor, access_flags, flags string,
-# init (repr, value) or None, field_idx).
-_F_CLS, _F_NAME, _F_DESC, _F_FLAGS, _F_FSTR, _F_INIT, _F_IDX = range(7)
-
-
-def _information(proto: str, registers) -> dict:
-    """EncodedMethod.get_information(), verbatim from androguard 4.1.3, for a
-    method whose code has `registers` registers (None: no code)."""
-    info = dict()
-    if registers is not None:
-        nb = registers
-        ret = proto.split(')')
-        params = ret[0][1:].split()
-
-        info["return"] = get_type(ret[1])
-
-        if params:
-            info["registers"] = (0, nb - len(params) - 1)
-            j = 0
-            info["params"] = []
-            for i in range(nb - len(params), nb):
-                info["params"].append((i, get_type(params[j])))
-                j += 1
-        else:
-            info["registers"] = (0, nb - 1)
-
-    return info
+        m = self._m
+        return m._rs._code_regs(m._d, m._code_off)
 
 
 class EncodedMethod(_Quiet):
     """androguard's EncodedMethod (after load()), for one entry of a
-    class_data."""
+    class_data: a handle (see above)."""
 
-    __slots__ = ("_vm", "_off", "_pos", "_row")
+    # _core: its DEX's _Core; _rs, _d: the native index and DEX number;
+    # _off, _pos: the class_data entry; _idx, _flags, _code_off: its
+    # method_idx, access_flags and code_off.
+    __slots__ = ("_core", "_rs", "_d", "_off", "_pos", "_idx", "_flags", "_code_off")
 
-    def __init__(self, vm: "DEX", class_data_off: int, pos: int, row):
-        self._vm = vm
-        self._off = class_data_off
-        self._pos = pos
-        self._row = row
+    @property
+    def _vm(self) -> "DEX":
+        return self._core.dex()
 
     # identity: the class_data entry
     def _ident(self):
-        return (self._vm._ident(), self._off, self._pos)
+        return (self._core.ident, self._off, self._pos)
 
     def __eq__(self, other):
         return isinstance(other, EncodedMethod) and self._ident() == other._ident()
@@ -1290,27 +1347,27 @@ class EncodedMethod(_Quiet):
 
     @property
     def class_name(self) -> str:
-        return self._row[_M_CLS]
+        return self._rs._m_class(self._d, self._idx)
 
     @property
     def name(self) -> str:
-        return self._row[_M_NAME]
+        return self._rs._m_name(self._d, self._idx)
 
     @property
     def proto(self) -> str:
-        return self._row[_M_DESC]
+        return self._rs._m_desc(self._d, self._idx)
 
     @property
     def access_flags(self) -> int:
-        return self._row[_M_FLAGS]
+        return self._flags
 
     @property
     def code_off(self) -> int:
-        return self._row[_M_CODE_OFF]
+        return self._code_off
 
     @property
     def method_idx(self) -> int:
-        return self._row[_M_IDX]
+        return self._idx
 
     @property
     def code(self):
@@ -1318,78 +1375,75 @@ class EncodedMethod(_Quiet):
 
     @property
     def descriptor(self) -> str:
-        return self._row[_M_DESC]
+        return self._rs._m_desc(self._d, self._idx)
 
     @property
     def full_name(self) -> str:
         return ' '.join([self.class_name, self.name, self.get_descriptor()])
 
     def get_class_name(self) -> str:
-        return self._row[_M_CLS]
+        return self._rs._m_class(self._d, self._idx)
 
     def get_name(self) -> str:
-        return self._row[_M_NAME]
+        return self._rs._m_name(self._d, self._idx)
 
     def get_descriptor(self) -> str:
-        return self._row[_M_DESC]
+        return self._rs._m_desc(self._d, self._idx)
 
     def get_access_flags(self) -> int:
-        return self._row[_M_FLAGS]
+        return self._flags
 
     def get_access_flags_string(self) -> str:
-        return self._row[_M_FSTR]
+        return self._rs._flags_str(0, self._flags)
 
     def get_code_off(self) -> int:
-        return self._row[_M_CODE_OFF]
+        return self._code_off
 
     def get_address(self) -> int:
-        return self._row[_M_CODE_OFF] + 0x10
+        return self._code_off + 0x10
 
     def get_method_idx(self) -> int:
-        return self._row[_M_IDX]
+        return self._idx
 
-    def _load(self):
-        return self._vm._insns(self._row[_M_CODE_OFF])
+    def _has_code(self) -> bool:
+        return self._rs._code_regs(self._d, self._code_off) is not None
 
     def get_code(self):
-        if not self._row[_M_HAS_CODE]:
+        if self._rs._code_regs(self._d, self._code_off) is None:
             return None
-        return DalvikCode(self._load, self._row[_M_REGS])
+        return DalvikCode(self)
 
     def get_instructions(self):
-        code = self.get_code()
-        if code is None:
+        if self._rs._code_regs(self._d, self._code_off) is None:
             return []
-        return code.get_bc().get_instructions()
+        return DCode(self).get_instructions()
 
     def get_instructions_idx(self):
-        if self.get_code() is None:
+        if not self._has_code():
             return
-        insns, offs = self._load()
-        yield from zip(offs, insns)
+        for i in _code_insns(self):
+            yield (i._row, i)
 
     def get_instruction(self, idx: int, off=None):
-        code = self.get_code()
-        if code is not None:
-            return code.get_bc().get_instruction(idx, off)
-        return None
+        if not self._has_code():
+            return None
+        return DCode(self).get_instruction(idx, off)
 
     def get_length(self) -> int:
-        code = self.get_code()
-        if code is not None:
-            return code.get_bc().get_length()
-        return 0
+        if not self._has_code():
+            return 0
+        return DCode(self).get_length()
 
     def get_locals(self) -> int:
         ret = self.proto.split(')')
         params = ret[0][1:].split()
-        code = self.get_code()
-        if code is None:
+        regs = self._rs._code_regs(self._d, self._code_off)
+        if regs is None:
             raise AttributeError("'NoneType' object has no attribute 'get_registers_size'")
-        return code.get_registers_size() - len(params) - 1
+        return regs - len(params) - 1
 
     def get_information(self) -> dict:
-        return _information(self.get_descriptor(), self._row[_M_REGS] if self._row[_M_HAS_CODE] else None)
+        return self._rs._m_info(self._d, self._idx, self._code_off)
 
     def __str__(self):
         return "{}->{}{} [access_flags={}] @ 0x{:x}".format(
@@ -1403,18 +1457,18 @@ class EncodedMethod(_Quiet):
 
 class EncodedField(_Quiet):
     """androguard's EncodedField (after load()), for one entry of a
-    class_data."""
+    class_data: a handle (see above)."""
 
-    __slots__ = ("_vm", "_off", "_pos", "_row")
+    # _ci: the class_def it was listed through (its static values are the
+    # class_data's, whichever class_def that is).
+    __slots__ = ("_core", "_rs", "_d", "_ci", "_off", "_pos", "_idx", "_flags")
 
-    def __init__(self, vm: "DEX", class_data_off: int, pos: int, row):
-        self._vm = vm
-        self._off = class_data_off
-        self._pos = pos
-        self._row = row
+    @property
+    def _vm(self) -> "DEX":
+        return self._core.dex()
 
     def _ident(self):
-        return (self._vm._ident(), self._off, self._pos, "field")
+        return (self._core.ident, self._off, self._pos, "field")
 
     def __eq__(self, other):
         return isinstance(other, EncodedField) and self._ident() == other._ident()
@@ -1428,45 +1482,44 @@ class EncodedField(_Quiet):
 
     @property
     def class_name(self) -> str:
-        return self._row[_F_CLS]
+        return self._rs._f_class(self._d, self._idx)
 
     @property
     def name(self) -> str:
-        return self._row[_F_NAME]
+        return self._rs._f_name(self._d, self._idx)
 
     @property
     def proto(self) -> str:
-        return self._row[_F_DESC]
+        return self._rs._f_type(self._d, self._idx)
 
     @property
     def access_flags(self) -> int:
-        return self._row[_F_FLAGS]
+        return self._flags
 
     @property
     def init_value(self):
         return self.get_init_value()
 
     def get_class_name(self) -> str:
-        return self._row[_F_CLS]
+        return self._rs._f_class(self._d, self._idx)
 
     def get_name(self) -> str:
-        return self._row[_F_NAME]
+        return self._rs._f_name(self._d, self._idx)
 
     def get_descriptor(self) -> str:
-        return self._row[_F_DESC]
+        return self._rs._f_type(self._d, self._idx)
 
     def get_access_flags(self) -> int:
-        return self._row[_F_FLAGS]
+        return self._flags
 
     def get_access_flags_string(self) -> str:
-        return self._row[_F_FSTR]
+        return self._rs._flags_str(1, self._flags)
 
     def get_field_idx(self) -> int:
-        return self._row[_F_IDX]
+        return self._idx
 
     def get_init_value(self):
-        init = self._row[_F_INIT]
-        return None if init is None else EncodedValue(_encoded_value(init[1]))
+        return self._rs._f_init(self._d, self._ci, self._pos, EncodedValue, _EncodedObject)
 
     def __str__(self):
         return "{}->{} {} [access_flags={}]\n".format(
@@ -1495,19 +1548,17 @@ def _encoded_value(v):
 
 
 class ClassDefItem(_Quiet):
-    """androguard's ClassDefItem for one class_def of a DEX. The name is
-    known up front; the rest (superclass, interfaces, flags, methods, fields)
-    is fetched when first asked for."""
+    """androguard's ClassDefItem for one class_def of a DEX: a handle (see
+    above)."""
 
-    __slots__ = ("_vm", "_ci", "_name")
+    __slots__ = ("_core", "_rs", "_d", "_ci")
 
-    def __init__(self, vm: "DEX", ci: int, name: str):
-        self._vm = vm
-        self._ci = ci
-        self._name = name
+    @property
+    def _vm(self) -> "DEX":
+        return self._core.dex()
 
     def _ident(self):
-        return (self._vm._ident(), self._ci)
+        return (self._core.ident, self._ci)
 
     def __eq__(self, other):
         return isinstance(other, ClassDefItem) and self._ident() == other._ident()
@@ -1515,8 +1566,9 @@ class ClassDefItem(_Quiet):
     def __hash__(self):
         return hash(self._ident())
 
-    def _info(self):
-        return self._vm._class(self._ci)
+    def _header(self):
+        # (flags string, superclass, interfaces, class_data_off)
+        return self._rs._c_header(self._d, self._ci)
 
     @property
     def CM(self) -> ClassManager:
@@ -1524,36 +1576,36 @@ class ClassDefItem(_Quiet):
 
     @property
     def name(self) -> str:
-        return self._name
+        return self._rs._c_name(self._d, self._ci)
 
     @property
     def sname(self) -> str:
-        return self._info()[0][2]
+        return self._header()[1]
 
     @property
     def interfaces(self) -> list:
-        return list(self._info()[0][3])
+        return self._header()[2]
 
     def get_name(self) -> str:
-        return self._name
+        return self._rs._c_name(self._d, self._ci)
 
     def get_superclassname(self) -> str:
-        return self._info()[0][2]
+        return self._header()[1]
 
     def get_interfaces(self) -> list:
-        return list(self._info()[0][3])
+        return self._header()[2]
 
     def get_access_flags_string(self) -> str:
-        return self._info()[0][1]
+        return self._header()[0]
 
     def get_class_data_off(self) -> int:
-        return self._info()[0][4]
+        return self._header()[3]
 
     def get_methods(self) -> list:
-        return list(self._info()[1])
+        return self._rs._h_methods(self._d, self._ci, self._core, EncodedMethod)
 
     def get_fields(self) -> list:
-        return list(self._info()[2])
+        return self._rs._h_fields(self._d, self._ci, self._core, EncodedField)
 
     def __str__(self):
         return "{}->{}".format(self.get_superclassname(), self.get_name())
@@ -1573,11 +1625,15 @@ class _MethodsView:
         self._vm = vm
 
     def __iter__(self):
-        for c in self._vm.get_classes():
-            yield from c.get_methods()
+        vm = self._vm
+        rs, d, core = vm._native(), vm._d, vm._core
+        for ci in range(rs.dex_class_count(d)):
+            yield from rs._h_methods(d, ci, core, EncodedMethod)
 
     def __len__(self):
-        return sum(len(c.get_methods()) for c in self._vm.get_classes())
+        vm = self._vm
+        rs, d = vm._native(), vm._d
+        return sum(rs._h_count(d, ci, False) for ci in range(rs.dex_class_count(d)))
 
     def __getitem__(self, i):
         return list(self)[i]
@@ -1589,6 +1645,32 @@ class _MethodsView:
         return list(other) + list(self)
 
 
+class _Core:
+    """What a DEX's handles need of it besides the native index: its
+    identity (for equality) and a weak reference to it (`_vm`, `CM`), so
+    handles keep no DEX alive. A DEX used on its own indexes itself here
+    when first asked."""
+
+    __slots__ = ("_dex", "ident", "rs", "d", "raw")
+
+    def __init__(self, dex: "DEX"):
+        self._dex = _weakref.ref(dex)
+        self.ident = dex._ident()
+        self.rs, self.d, self.raw = dex._rs, dex._d, dex._raw
+
+    def dex(self) -> "DEX":
+        return self._dex()
+
+    def native(self):
+        """The native index (a DEX used on its own indexes itself when
+        first asked)."""
+        if self.rs is None:
+            self.rs = _native.Apk.from_dex_list([self.raw])
+            self.d = 0
+            self.raw = None
+        return self.rs
+
+
 class DEX(_Quiet):
     """``androguard.core.dex.DEX`` drop-in.
 
@@ -1596,7 +1678,7 @@ class DEX(_Quiet):
     raises (``ValueError("Not a DEX file, Header too small.")``, ``"This is
     not a DEX file! Wrong endian tag: ..."``, wrong magic, Adler-32
     checksum, header size, id counts; ``NotImplementedError`` for a
-    byte-swapped tag), so callers' error handling works unchanged; then checks
+    byte-swapped tag), so code catching them works unchanged; then checks
     the native reader can parse it (``ValueError`` otherwise). The bytes are
     kept until an ``androguard_rs.analysis.Analysis`` it was added to runs
     ``create_xref()``, which indexes every added DEX together and binds each
@@ -1604,30 +1686,27 @@ class DEX(_Quiet):
 
     ``AnalyzeAPK`` returns one per DEX file, bound to its index."""
 
-    __slots__ = ("_raw", "_rs", "_d", "CM", "api_version", "_classes", "_cache", "_insn_cache", "_analysis",
-                 "__weakref__")
-
-    _CLASS_CACHE = 512
-    _INSN_CACHE = 256
+    __slots__ = ("_raw", "_rs", "_d", "CM", "api_version", "_core", "_analysis",
+                 "_ag_add", "_ag_xref", "__weakref__")
 
     def __init__(self, buff, decompiler=None, config=None, using_api=None):
-        err = _native._dex_header_error(buff)
-        if err is not None:
-            raise (NotImplementedError if err[0] == "NotImplementedError" else ValueError)(err[1])
-        _native._dex_parse_check(buff)
+        load, add, xref = _native._dex_check(buff, _agerr.max_depth(_sys._getframe(0)), _agerr.c_units())
+        if load is not None:
+            raise _agerr.make(load)
         self._init(None, None)
-        self._raw = buff
+        self._ag_add, self._ag_xref = add, xref
+        self._raw = self._core.raw = buff
         self.api_version = using_api if using_api else 16
 
     def _init(self, rs, d):
+        self._core = None
         self._raw = None
+        self._ag_add = self._ag_xref = None
         self._rs = rs
         self._d = d
         self.CM = ClassManager(self)
         self.api_version = 16
-        self._classes = None
-        self._cache = _LRU(self._CLASS_CACHE)
-        self._insn_cache = _LRU(self._INSN_CACHE)
+        self._core = _Core(self)
         self._analysis = None
 
     @classmethod
@@ -1639,51 +1718,36 @@ class DEX(_Quiet):
         return self
 
     def _bind(self, rs, d: int) -> None:
-        """Serve this DEX from `rs` (an index over every added DEX), drop the
-        bytes and anything cached from a private index."""
+        """Serve this DEX from `rs` (an index over every added DEX) and drop
+        the bytes and any private index."""
         self._rs, self._d, self._raw = rs, d, None
-        self._classes = None
-        self._cache = _LRU(self._CLASS_CACHE)
-        self._insn_cache = _LRU(self._INSN_CACHE)
+        self._core = _Core(self)
 
     def _native(self):
         if self._rs is None:
-            self._rs = _native.Apk.from_dex_list([self._raw])
-            self._d = 0
+            core = self._core
+            self._rs, self._d = core.native(), core.d
         return self._rs
 
     def _ident(self):
         return id(self)
 
-    def _class(self, ci: int):
-        """(header, methods, fields) of class_def `ci`. Members are kept per
-        class_data (class_defs sharing one get the same objects, as in
-        androguard), headers per class_def, both in bounded LRUs."""
-        def make_header():
-            name, flags, sup, ifaces, off = self._native().dex_class_header(self._d, ci)
-            return (name, flags, sup, tuple(ifaces), off)
+    def _class(self, ci: int) -> ClassDefItem:
+        """The ClassDefItem of class_def `ci`."""
+        return self._native()._h_class(self._d, ci, self._core, ClassDefItem)
 
-        header = self._cache.get(("h", ci), make_header)
-        off = header[4]
+    def _method(self, ci: int, pos: int) -> EncodedMethod:
+        """get_classes()[ci].get_methods()[pos]."""
+        return self._native()._h_methods(self._d, ci, self._core, EncodedMethod, pos)
 
-        def make_members():
-            if off == 0:
-                return ((), ())
-            mrows, frows = self._native().dex_class_members(self._d, ci)
-            return (tuple(EncodedMethod(self, off, i, r) for i, r in enumerate(mrows)),
-                    tuple(EncodedField(self, off, i, r) for i, r in enumerate(frows)))
-
-        methods, fields = self._cache.get(("m", off), make_members) if off else ((), ())
-        return (header, methods, fields)
+    def _field(self, ci: int, pos: int) -> EncodedField:
+        """get_classes()[ci].get_fields()[pos]."""
+        return self._native()._h_fields(self._d, ci, self._core, EncodedField, pos)
 
     def _insns(self, code_off: int):
-        def make():
-            data = self._native().code_instructions(self._d, code_off)
-            if data is None:
-                return ([], [])
-            return (_instructions(data), [r[0] for r in data[1]])
-
-        return self._insn_cache.get(code_off, make)
+        """The Instruction handles (a tuple) of the code_item at
+        `code_off`, () without one."""
+        return _handles(self._native(), self._d, code_off) or ()
 
     # androguard API
     def set_analysis(self, analysis_dex) -> None:
@@ -1699,18 +1763,20 @@ class DEX(_Quiet):
         return self.CM
 
     def get_classes(self) -> list:
-        if self._classes is None:
-            names = self._native().dex_class_names(self._d)
-            self._classes = [ClassDefItem(self, ci, n) for ci, n in enumerate(names)]
-        return self._classes
+        return self._native()._h_classes(self._d, self._core, ClassDefItem)
 
     def get_classes_names(self, update: bool = False) -> list:
-        return [c.get_name() for c in self.get_classes()]
+        return self._native().dex_class_names(self._d)
 
     def get_len_classes(self) -> int:
-        return len(self.get_classes())
+        return self._native().dex_class_count(self._d)
 
     def get_class(self, name: str):
+        # androguard: the first class_def named `name`, by a linear scan;
+        # here a native lookup.
+        if isinstance(name, str):
+            ci = self._native()._dex_first_class(self._d, name)
+            return None if ci is None else self._class(ci)
         for i in self.get_classes():
             if i.get_name() == name:
                 return i
@@ -1718,6 +1784,42 @@ class DEX(_Quiet):
 
     def get_encoded_methods(self):
         return _MethodsView(self)
+
+    def find_methods_referencing(self, names=(), rules=(), include_unreadable: bool = True) -> list:
+        """androguard_rs extension (not androguard API): the EncodedMethods
+        of `get_encoded_methods()`, in that order, whose `get_name()` is in
+        `names`, or one of whose instructions passes one of `rules`, or
+        (with `include_unreadable`) whose code can't be read or disassembled
+        (its `get_instructions()` raises). Each rule is `(opcode names or
+        None, "endswith" or "contains", text)`: an instruction passes when
+        its `get_name()` is one of the opcode names (None: any instruction)
+        and its `get_output()` ends with / contains `text`, or is None. The
+        same methods as walking every method's instructions with those
+        tests, done natively over the bytecode in one pass, classes in
+        parallel; a caller narrowing a walk to the methods it would act on
+        runs its own checks on these only. Raises ValueError for an unknown
+        opcode name or mode, and where walking `get_encoded_methods()` would
+        (a class whose members can't be read)."""
+        ops_by_name = {}
+        for op, name in enumerate(_NAMES):
+            ops_by_name.setdefault(name, []).append(op)
+        native_rules = []
+        for ops, mode, text in rules:
+            if mode not in ("endswith", "contains"):
+                raise ValueError(f"unknown rule mode {mode!r}")
+            if ops is None:
+                values = None
+            else:
+                if isinstance(ops, str):
+                    ops = (ops,)
+                values = []
+                for n in ops:
+                    if n not in ops_by_name or n == "unused":
+                        raise ValueError(f"unknown opcode name {n!r}")
+                    values += ops_by_name[n]
+            native_rules.append((values, mode == "endswith", text))
+        hits = self._native()._dex_methods_referencing(self._d, list(names), native_rules, include_unreadable)
+        return [self._method(ci, pos) for ci, pos in hits]
 
     def get_len_encoded_methods(self) -> int:
         return len(self.get_encoded_methods())
@@ -1729,7 +1831,7 @@ class DEX(_Quiet):
     def get_encoded_method_descriptor(self, class_name: str, method_name: str, descriptor: str):
         key = class_name + method_name + descriptor
         hit = self._native().dex_find_member(self._d, key, False)
-        return None if hit is None else self.get_classes()[hit[0]].get_methods()[hit[1]]
+        return None if hit is None else self._method(*hit)
 
     def get_encoded_methods_class_method(self, class_name: str, method_name: str):
         for i in self.get_encoded_methods():
@@ -1741,15 +1843,15 @@ class DEX(_Quiet):
         return [i for i in self.get_encoded_methods() if class_name == i.get_class_name()]
 
     def get_encoded_fields(self) -> list:
-        return [f for c in self.get_classes() for f in c.get_fields()]
+        rs, d, core = self._native(), self._d, self._core
+        return [f for ci in range(rs.dex_class_count(d)) for f in rs._h_fields(d, ci, core, EncodedField)]
 
     def get_len_encoded_fields(self) -> int:
         return len(self._native().dex_field_names(self._d))
 
     def get_encoded_field(self, name: str) -> list:
         prog = _re.compile(name)
-        classes = self.get_classes()
-        return [classes[ci].get_fields()[pos] for ci, pos, fname in self._native().dex_field_names(self._d)
+        return [self._field(ci, pos) for ci, pos, fname in self._native().dex_field_names(self._d)
                 if prog.match(fname)]
 
     def get_encoded_fields_class(self, class_name: str) -> list:
@@ -1758,21 +1860,7 @@ class DEX(_Quiet):
     def get_encoded_field_descriptor(self, class_name: str, field_name: str, descriptor: str):
         key = class_name + field_name + descriptor
         hit = self._native().dex_find_member(self._d, key, True)
-        return None if hit is None else self.get_classes()[hit[0]].get_fields()[hit[1]]
-
-    def get_ssl_candidate_methods(self) -> list:
-        """Not androguard: the EncodedMethods of get_encoded_methods(), in its
-        order, that may implement or weaken TLS certificate/hostname
-        validation (a cheap superset for callers that then run their own
-        per-method checks: a method named checkServerTrusted, verify or
-        onReceivedSslError, or whose code new-instances a type ending in
-        ``Lorg/apache/http/conn/ssl/AllowAllHostnameVerifier;``, sget-objects
-        a field containing ``...SSLSocketFactory;->ALLOW_ALL_HOSTNAME_VERIFIER``,
-        invoke-statics a method ending in ``...->getInsecure(I
-        Landroid/net/SSLSessionCache;)Ljavax/net/ssl/SSLSocketFactory;``, or
-        can't be read or disassembled)."""
-        classes = self.get_classes()
-        return [classes[ci].get_methods()[pos] for ci, pos in self._native().ssl_candidates(self._d)]
+        return None if hit is None else self._field(*hit)
 
     def __repr__(self):
         return f"<androguard_rs.dex.DEX #{self._d}>"

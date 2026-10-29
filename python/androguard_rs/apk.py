@@ -1,7 +1,7 @@
 """``androguard.core.apk`` drop-in: ``APK``, ``FileNotPresent``.
 
 ``APK(filename)`` / ``APK(data, raw=True)`` with androguard 4.1.3's results
-for its manifest, file, signing and resources methods, without androguard:
+for the methods implemented, without androguard:
 
 - the zip is read natively the way apkInspector reads it (same names, same
   order, same extraction rules; ``androguard_rs.ApkFile``), from the file
@@ -29,7 +29,8 @@ Deliberate differences:
   androguard runs. ``get_permissions()`` is ``list(set(...))`` as in
   androguard.
 - Exceptions from a broken zip or signing block are ``androguard_rs.ApkError``
-  (or ``BrokenAPKError`` where androguard raises that); a missing file is
+  (or ``BrokenAPKError`` where androguard raises that, and ``struct.error``
+  for a signing block cut short, as androguard's unpack raises); a missing file is
   ``FileNotPresent``. A zip entry over 256 MiB, more than 2^20 zip entries,
   or a signer block over 16 MiB raise instead of being processed.
 - Anything else androguard's ``APK`` has raises ``NotImplementedError``
@@ -39,6 +40,8 @@ Deliberate differences:
 
 from __future__ import annotations
 
+import struct
+
 import hashlib
 import io
 import os
@@ -46,7 +49,7 @@ import re
 from collections import Counter
 from typing import Iterator, Union
 
-from . import _native
+from . import _arscconfig, _native
 from .axml import AXMLPrinter
 
 __all__ = ["APK", "Error", "FileNotPresent", "BrokenAPKError", "ARSCParser", "APK_GAPS", "NS_ANDROID", "NS_ANDROID_URI"]
@@ -139,10 +142,20 @@ def _gap(owner: str, attr: str):
     raise NotImplementedError(f"androguard_rs: {key} is not implemented")
 
 
+def _sig_error(error: str) -> Exception:
+    """The exception for a signing-block parse error: androguard's own
+    ``struct.error`` for a short read, else ``ApkError``."""
+    if error.startswith("unpack requires a buffer of "):
+        return struct.error(error)
+    return _native.ApkError(error)
+
+
 class ARSCParser:
     """``ARSCParser`` methods over ``androguard_rs.Resources`` (same results;
     errors are ``ResourcesError``). ``get_resolved_res_configs`` returns
-    ``(config_tuple, value)`` pairs where androguard has config objects."""
+    androguard's ``ARSCResTableConfig`` objects (``androguard_rs.axml``),
+    built from the bytes androguard reads them from, one per type chunk as
+    in androguard."""
 
     __slots__ = ("_r",)
 
@@ -161,7 +174,7 @@ class ARSCParser:
     def get_resolved_res_configs(self, rid, config=None):
         if config is not None:
             _gap("ARSCParser", "get_resolved_res_configs(config=...)")
-        return self._r.get_resolved_res_configs(rid)
+        return self._r.get_resolved_res_configs(rid, _arscconfig.from_bytes)
 
     def get_resource_xml_name(self, r_id, package=None):
         return self._r.get_resource_xml_name(r_id, package)
@@ -387,7 +400,7 @@ class APK:
 
     @property
     def _APK__raw(self):
-        """androguard's private ``__raw`` (the APK's bytes), which some callers read."""
+        """androguard's private ``__raw`` (the APK's bytes), as ``apk._APK__raw``."""
         return self._file.raw()
 
     def get_raw(self) -> bytes:
@@ -626,7 +639,7 @@ class APK:
         if error is not None:
             if error.startswith(("No Central Dir", "Sizes at beginning")):
                 raise BrokenAPKError(error)
-            raise _native.ApkError(error)
+            raise _sig_error(error)
 
     def _signer_certs(self, v3: bool) -> list:
         attr = "_v3_signing_data" if v3 else "_v2_signing_data"
@@ -641,7 +654,7 @@ class APK:
             if error is not None:
                 if "does not match" in error:
                     raise BrokenAPKError(error)
-                raise _native.ApkError(error)
+                raise _sig_error(error)
         return list(getattr(self, attr))
 
     def get_certificates_der_v2(self) -> list:
