@@ -198,3 +198,21 @@ def test_arsc_shim(pair, which):
         assert ours.get_resource_xml_name(rid) == ag.get_resource_xml_name(rid)
         exp = [(c._get_tuple(), v) for c, v in ag.get_resolved_res_configs(rid)]
         assert ours.get_resolved_res_configs(rid) == exp
+
+
+def test_native_whole_apk_queries(pair):
+    """const_strings() / search_instruction_text() against the same walk over
+    androguard's Analysis."""
+    import random
+
+    from walks import NEEDLES, const_strings_walk, native_const_strings, native_search, search_walk
+
+    (_a, dx), (_ca, cdx) = pair
+    assert native_const_strings(cdx) == const_strings_walk(dx)
+    names = sorted(ca.name for ca in dx.get_classes() if not ca.is_external())
+    queries = list(NEEDLES)
+    for name in random.Random(5).sample(names, min(15, len(names))):
+        java = name[1:-1].replace("/", ".")
+        queries.append([java.lower(), name.lower(), java.replace(".", "/").lower()])
+    for needles in queries:
+        assert native_search(cdx, needles) == search_walk(dx, needles), needles

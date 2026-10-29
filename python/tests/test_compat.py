@@ -228,3 +228,15 @@ def test_unknown_attributes_are_loud(path, dx):
         arsc.get_resolved_res_configs(1, config=object())
     assert sum(compat.GAPS.values()) == len(objs) + 2
     assert Counter(k.split(".")[0] for k in compat.GAPS)["Analysis"] == 1
+
+
+def test_native_whole_apk_queries(dx):
+    """const_strings() / search_instruction_text() give what a walk over the
+    facade's own get_classes() / get_methods() / instructions gives."""
+    from walks import NEEDLES, const_strings_walk, native_const_strings, native_search, search_walk
+
+    assert native_const_strings(dx) == const_strings_walk(dx)
+    assert const_strings_walk(dx)
+    names = [ca.name for ca in dx.get_classes() if not ca.is_external()]
+    for needles in NEEDLES + [[n.lower()] for n in names]:
+        assert native_search(dx, needles) == search_walk(dx, needles), needles

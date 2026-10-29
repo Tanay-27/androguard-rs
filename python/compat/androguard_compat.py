@@ -878,6 +878,27 @@ class Analysis(_Loud):
                             and re.match(accessflags, "" if external else row[3])):
                         yield ma
 
+    # androguard_rs extensions (not androguard API): whole-APK queries served
+    # natively, for callers that would otherwise walk every instruction.
+    def const_strings(self, include_jumbo: bool = False):
+        """[(class name, [(method name, descriptor, [get_output() of each
+        const-string, in order]), ...]), ...] for the internal classes, in
+        get_classes() / get_methods() order, methods without one left out.
+        See androguard_rs.Apk.const_strings."""
+        return self._rs.const_strings(include_jumbo)
+
+    def search_instruction_text(self, needles):
+        """(ClassAnalysis, MethodAnalysis) of each internal class's method,
+        in get_classes() / get_methods() order, one of whose instructions'
+        get_output().lower() contains one of `needles` (matched as given:
+        pass them lower-cased). Same result as walking every method's
+        get_instructions_idx(), without decoding anything into Python."""
+        for sig, key, cls in self._rs.search_instruction_text(list(needles), keys=True):
+            ca = self.get_class_analysis(cls)
+            row = ca._row_of(sig if key is None else key)
+            yield ca, MethodAnalysis(self, cls, sig, row[1], row[2], row, _row_key(row, ca.name),
+                                     row[6] if len(row) > 6 else None)
+
 
 # ── Resources ─────────────────────────────────────────────────────────────────
 

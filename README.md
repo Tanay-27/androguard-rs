@@ -33,7 +33,7 @@ Prebuilt wheels (Linux x86_64/aarch64 manylinux, macOS arm64; abi3, Python
 `SHA256SUMS` file:
 
 ```sh
-gh release download v0.1.0 -R Tanay-27/androguard-rs -p '*.whl' -p SHA256SUMS
+gh release download v0.1.1 -R Tanay-27/androguard-rs -p '*.whl' -p SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
 pip install androguard_rs-*.whl
 ```
@@ -76,6 +76,18 @@ for ca in dx.find_classes(r"Lcom/example/.*"):
         for _cls, caller, offset in ma.get_xref_from():
             print("  called from", caller.class_name, caller.name, hex(offset))
 ```
+
+Two extensions on `Analysis` (not androguard API) answer whole-APK
+instruction scans natively, without decoding every method into Python:
+
+```python
+dx.const_strings()                     # [(class, [(method, descriptor, [const-string outputs])])]
+for ca, ma in dx.search_instruction_text(["ljavax/net/ssl/"]):   # lower-cased needles
+    ...                                # methods whose instruction text contains one
+```
+
+Both return exactly what the equivalent walk over `get_classes()` /
+`get_methods()` / `get_instructions_idx()` returns, in the same order.
 
 Building the analysis yourself works as in androguard:
 
