@@ -1,0 +1,13 @@
+[package]
+name = "spike"
+version = "0.1.0"
+edition = "2024"
+description = "androguard-rs CLI: measurements, parity dumps, mutation fuzzer"
+license = "Apache-2.0"
+repository = "https://github.com/Tanay-27/androguard-rs"
+publish = false
+
+[dependencies]
+anyhow = "1.0.104"
+androguard-core = { path = "../core" }
+dex-bytecode = { path = "../vendor/dex-bytecode" }

@@ -1,0 +1,80 @@
+# Optional: full parity suite against androguard 4.1.3 on a corpus of APKs.
+# Skipped unless the repository variable PARITY_APK_URLS is set; see docs/ci.md.
+#
+#   variable PARITY_APK_URLS     https URLs of APKs, separated by spaces or newlines
+#   variable PARITY_APK_SHA256   optional: lines of "<sha256>  <file name>" (sha256sum
+#                                format, file name = last path component of the URL);
+#                                when set, every downloaded APK must be listed and match
+#   variable PARITY_LARGE_MIN_MB optional (default 100): larger APKs only go to
+#                                PARITY_LARGE_APKS (the resources tests)
+#   variable PARITY_RUNNER       optional runner label (default ubuntu-latest)
+name: Parity (optional)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1" # Mondays 03:17 UTC
+
+permissions:
+  contents: read
+
+concurrency:
+  group: parity-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  parity:
+    name: Full parity suite
+    if: vars.PARITY_APK_URLS != ''
+    runs-on: ${{ vars.PARITY_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Download corpus
+        env:
+          APK_URLS: ${{ vars.PARITY_APK_URLS }}
+          APK_SHA256: ${{ vars.PARITY_APK_SHA256 }}
+          LARGE_MIN_MB: ${{ vars.PARITY_LARGE_MIN_MB || '100' }}
+        run: |
+          set -euo pipefail
+          CORPUS_DIR="$RUNNER_TEMP/parity-corpus"
+          mkdir -p "$CORPUS_DIR"
+          for url in $APK_URLS; do
+            case "$url" in
+              https://*) ;;
+              *) echo "::error::only https URLs are accepted: $url"; exit 1 ;;
+            esac
+            name="$(basename "${url%%\?*}")"
+            curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --retry 3 \
+              --output "$CORPUS_DIR/$name" "$url"
+          done
+          if [ -n "$APK_SHA256" ]; then
+            (cd "$CORPUS_DIR" && printf '%s\n' "$APK_SHA256" | sha256sum --check --strict)
+            for f in "$CORPUS_DIR"/*; do
+              grep -q "  $(basename "$f")\$" <<< "$APK_SHA256" || { echo "::error::no checksum for $(basename "$f")"; exit 1; }
+            done
+          fi
+          small=(); large=()
+          while IFS= read -r -d '' f; do
+            if [ "$(stat -c %s "$f")" -gt $(( LARGE_MIN_MB * 1024 * 1024 )) ]; then large+=("$f"); else small+=("$f"); fi
+          done < <(find "$CORPUS_DIR" -type f -print0 | sort -z)
+          echo "corpus: ${#small[@]} APK(s) for the full suite, ${#large[@]} large APK(s) for resources only"
+          (IFS=:; echo "PARITY_APKS=${small[*]:-}"; echo "PARITY_LARGE_APKS=${large[*]:-}") >> "$GITHUB_ENV"
+
+      - name: maturin build and install
+        run: |
+          python -m pip install "maturin>=1.15,<2"
+          maturin build --release --locked -m python/Cargo.toml --out dist
+          python -m venv .venv-test
+          .venv-test/bin/python -m pip install "androguard==4.1.3" "mutf8==1.1.0" pytest dist/*.whl
+
+      - name: pytest python/tests (full parity)
+        run: .venv-test/bin/python -m pytest python/tests -rs -p no:cacheprovider

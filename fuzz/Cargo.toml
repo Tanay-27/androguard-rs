@@ -1,0 +1,68 @@
+[package]
+name = "androguard-rust-fuzz"
+version = "0.0.0"
+publish = false
+license = "Apache-2.0"
+repository = "https://github.com/Tanay-27/androguard-rs"
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+androguard-core = { path = "../core" }
+dex-bytecode = { path = "../vendor/dex-bytecode" }
+
+# Its own workspace: built with `cargo +nightly fuzz`, not the main one.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "dex_pipeline"
+path = "fuzz_targets/dex_pipeline.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "text"
+path = "fuzz_targets/text.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "apk"
+path = "fuzz_targets/apk.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "arsc"
+path = "fuzz_targets/arsc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "axml"
+path = "fuzz_targets/axml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "apkzip"
+path = "fuzz_targets/apkzip.rs"
+test = false
+doc = false
+bench = false

@@ -1,0 +1,8 @@
+/target
+*.apk
+*.dex
+/out
+.DS_Store
+__pycache__/
+*.so
+python/androguard_rs/*.pyd

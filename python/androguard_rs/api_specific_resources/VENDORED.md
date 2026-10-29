@@ -1,0 +1,1 @@
+../../licenses/androguard-VENDORED.md

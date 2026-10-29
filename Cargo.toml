@@ -1,0 +1,18 @@
+[workspace]
+resolver = "3"
+members = ["core", "python", "spike", "vendor/dex-bytecode"]
+# The PyO3 extension only links under maturin (`maturin develop` in python/).
+default-members = ["core", "spike", "vendor/dex-bytecode"]
+# cargo-fuzz targets build on nightly from their own workspace in fuzz/.
+exclude = ["fuzz"]
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+
+# For `spike fuzz`: release speed, but integer overflow and debug assertions
+# panic, so the fuzzer catches arithmetic bugs as well as crashes.
+[profile.fuzz]
+inherits = "release"
+overflow-checks = true
+debug-assertions = true

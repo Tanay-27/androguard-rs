@@ -1,0 +1,39 @@
+[build-system]
+requires = ["maturin>=1.15,<2"]
+build-backend = "maturin"
+
+[project]
+name = "androguard-rs"
+version = "0.1.0"
+description = "Fast, memory-bounded drop-in for androguard 4.1.3's APK, DEX, Analysis, AXML and ARSC APIs, with byte-identical output"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+keywords = ["android", "apk", "dex", "androguard", "reverse-engineering"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Topic :: Security",
+    "Topic :: Software Development :: Disassemblers",
+]
+# lxml: the manifest and AXMLPrinter trees are lxml elements, as in androguard.
+dependencies = ["lxml"]
+# Ships the project's Apache-2.0 LICENSE and NOTICE, the vendored dex-bytecode
+# LICENSE and its modification notice (VENDORED.md), and the androguard notice
+# in every wheel. licenses/ holds symlinks to the top-level files and into
+# vendor/dex-bytecode/, because license-files can't reach outside this directory.
+license-files = ["licenses/*"]
+
+[project.urls]
+Repository = "https://github.com/Tanay-27/androguard-rs"
+Issues = "https://github.com/Tanay-27/androguard-rs/issues"
+
+[tool.maturin]
+# The native module is androguard_rs.androguard_rs; androguard_rs/ (Python)
+# re-exports it and adds the androguard drop-ins (apk, axml, misc, ...).
+module-name = "androguard_rs.androguard_rs"
+python-source = "."
+python-packages = ["androguard_rs"]
+# Python bytecode caches from editable installs
+exclude = ["androguard_rs/**/__pycache__/**"]
