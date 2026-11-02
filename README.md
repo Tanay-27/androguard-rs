@@ -35,7 +35,7 @@ Prebuilt wheels (Linux x86_64/aarch64 manylinux, macOS arm64; abi3, Python
 `SHA256SUMS` file:
 
 ```sh
-gh release download v0.1.2 -R Tanay-27/androguard-rs -p '*.whl' -p SHA256SUMS
+gh release download v0.1.3 -R Tanay-27/androguard-rs -p '*.whl' -p SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
 pip install androguard_rs-*.whl
 ```
@@ -183,6 +183,18 @@ Tuning: `ANDROGUARD_RS_CACHE` (`noatoms`, `spans`, `text`, `lru=N`,
 comma-separated, read when the index is built) changes what the native
 index keeps between queries; the default is recommended. See
 [`docs/dex-api-map.md`](docs/dex-api-map.md).
+
+Threads: the parallel scans run on androguard-rs's own pool, sized by
+`ANDROGUARD_RS_THREADS`, else `RAYON_NUM_THREADS`, else the available CPUs
+(on Linux that honours the cgroup CPU limit). Long native calls release
+the GIL.
+
+Fork: a process may `os.fork()` after loading and keep querying what it
+loaded in the children, which share its memory copy-on-write (a forked
+child builds its own pool on first use, and file reads are positioned, so
+no seek offset is shared). Fork while no other thread is inside an
+androguard-rs call, as with any library that has locks; calling
+`gc.freeze()` first keeps Python's collector from copying shared pages.
 
 `androguard_rs.Resources(arsc_bytes)` (or `Resources.from_apk(path)`)
 provides `ARSCParser`'s `get_packages_names()`, `get_public_resources()`,

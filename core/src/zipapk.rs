@@ -26,7 +26,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+#[cfg(not(unix))]
 use std::sync::Mutex;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -49,8 +49,14 @@ pub trait ReadAt: Send + Sync {
     fn read_at(&self, off: u64, buf: &mut [u8]) -> std::io::Result<usize>;
 }
 
-/// A file read with seeks, never loaded whole.
+/// A file read in place, never loaded whole. On Unix each read is a
+/// positioned read (pread), so there is no shared file offset: concurrent
+/// reads don't serialize, and a forked child sharing the descriptor can't
+/// move the parent's reads.
 pub struct FileSource {
+    #[cfg(unix)]
+    f: File,
+    #[cfg(not(unix))]
     f: Mutex<File>,
     len: u64,
 }
@@ -59,7 +65,9 @@ impl FileSource {
     pub fn open(path: &str) -> Result<FileSource> {
         let f = File::open(path).with_context(|| format!("opening {path}"))?;
         let len = f.metadata()?.len();
-        Ok(FileSource { f: Mutex::new(f), len })
+        #[cfg(not(unix))]
+        let f = Mutex::new(f);
+        Ok(FileSource { f, len })
     }
 }
 
@@ -67,7 +75,23 @@ impl ReadAt for FileSource {
     fn size(&self) -> u64 {
         self.len
     }
+    #[cfg(unix)]
     fn read_at(&self, off: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+        use std::os::unix::fs::FileExt;
+        let mut n = 0;
+        while n < buf.len() {
+            match self.f.read_at(&mut buf[n..], off + n as u64) {
+                Ok(0) => break,
+                Ok(k) => n += k,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(n)
+    }
+    #[cfg(not(unix))]
+    fn read_at(&self, off: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+        use std::io::{Read, Seek, SeekFrom};
         let mut f = self.f.lock().unwrap_or_else(|e| e.into_inner());
         f.seek(SeekFrom::Start(off))?;
         let mut n = 0;

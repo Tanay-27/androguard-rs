@@ -16,6 +16,7 @@ pub mod irregular;
 pub mod insn_rows;
 pub mod maplist;
 pub mod model;
+pub mod pool;
 mod py_decimal;
 mod py_lower_tables;
 mod py_printable;

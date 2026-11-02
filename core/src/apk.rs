@@ -279,85 +279,87 @@ pub fn load_zip_mode(
 type Inner = (Vec<Dex>, Vec<SkippedDex>, Vec<usize>, Option<crate::agload::AgErr>);
 
 fn load_zip_inner(zip: &ApkZip<'_>, entries: &[String], mode: HeaderMode, max_depth: (i64, i64)) -> Result<Inner> {
-    use crate::agload::{self, AgErr};
-    let used = AtomicU64::new(0);
-    // Ok(Ok((dex, add error, create_xref error))) or Ok(Err((left out, its DEX() error))).
-    type One = std::result::Result<(Dex, Option<AgErr>, Option<AgErr>), (SkippedDex, Option<AgErr>)>;
-    let loaded: Vec<One> = entries
-        .par_iter()
-        .enumerate()
-        .map(|(pos, name)| {
-            let budget = MAX_TOTAL_DEX_BYTES.saturating_sub(used.load(Ordering::Relaxed));
-            let buf = match zip.read_capped(name, budget.min(MAX_DEX_BYTES)) {
-                Ok(b) => b,
-                Err(ReadError::NotPresent) => bail!("{name}: not present (androguard: FileNotPresent)"),
-                Err(ReadError::Failed(e)) => return Err(e.context(format!("reading {name}"))),
-            };
-            let total = used.fetch_add(buf.len() as u64, Ordering::Relaxed) + buf.len() as u64;
-            if total > MAX_TOTAL_DEX_BYTES {
-                bail!("DEX files total over the {MAX_TOTAL_DEX_BYTES}-byte limit");
-            }
-            if mode == HeaderMode::Record {
-                // Every check androguard's DEX() makes, then Analysis.add()'s
-                // and create_xref()'s.
-                let st = match agload::load(&buf, max_depth.0, max_depth.1) {
-                    Ok(st) => st,
-                    Err(e) => {
-                        let (message, not_implemented) = match &e {
-                            AgErr::Header { message, not_implemented } => (message.clone(), *not_implemented),
-                            other => (format!("{other:?}"), false),
-                        };
-                        return Ok(Err((SkippedDex { name: name.clone(), message, pos, not_implemented }, Some(e))));
-                    }
+    crate::pool::install(|| {
+        use crate::agload::{self, AgErr};
+        let used = AtomicU64::new(0);
+        // Ok(Ok((dex, add error, create_xref error))) or Ok(Err((left out, its DEX() error))).
+        type One = std::result::Result<(Dex, Option<AgErr>, Option<AgErr>), (SkippedDex, Option<AgErr>)>;
+        let loaded: Vec<One> = entries
+            .par_iter()
+            .enumerate()
+            .map(|(pos, name)| {
+                let budget = MAX_TOTAL_DEX_BYTES.saturating_sub(used.load(Ordering::Relaxed));
+                let buf = match zip.read_capped(name, budget.min(MAX_DEX_BYTES)) {
+                    Ok(b) => b,
+                    Err(ReadError::NotPresent) => bail!("{name}: not present (androguard: FileNotPresent)"),
+                    Err(ReadError::Failed(e)) => return Err(e.context(format!("reading {name}"))),
                 };
-                if st.no_map {
-                    // Analysis.add() fails on it; nothing to index.
-                    let e = agload::add_error_no_map();
-                    let s = SkippedDex { name: name.clone(), message: format!("{e:?}"), pos, not_implemented: false };
-                    return Ok(Err((s, Some(e))));
+                let total = used.fetch_add(buf.len() as u64, Ordering::Relaxed) + buf.len() as u64;
+                if total > MAX_TOTAL_DEX_BYTES {
+                    bail!("DEX files total over the {MAX_TOTAL_DEX_BYTES}-byte limit");
                 }
-                let dex = Dex::parse(buf).with_context(|| format!("parsing {name}"))?;
-                let add = agload::add_error(&st, &dex);
-                let xref = if add.is_none() { agload::xref_error(&st, &dex) } else { None };
-                return Ok(Ok((dex, add, xref)));
-            }
-            if let Some(e) = androguard_header_check(&buf, false) {
-                if mode == HeaderMode::Tolerant && e.skippable {
-                    return Ok(Err((SkippedDex { name: name.clone(), message: e.message, pos, not_implemented: e.not_implemented }, None)));
+                if mode == HeaderMode::Record {
+                    // Every check androguard's DEX() makes, then Analysis.add()'s
+                    // and create_xref()'s.
+                    let st = match agload::load(&buf, max_depth.0, max_depth.1) {
+                        Ok(st) => st,
+                        Err(e) => {
+                            let (message, not_implemented) = match &e {
+                                AgErr::Header { message, not_implemented } => (message.clone(), *not_implemented),
+                                other => (format!("{other:?}"), false),
+                            };
+                            return Ok(Err((SkippedDex { name: name.clone(), message, pos, not_implemented }, Some(e))));
+                        }
+                    };
+                    if st.no_map {
+                        // Analysis.add() fails on it; nothing to index.
+                        let e = agload::add_error_no_map();
+                        let s = SkippedDex { name: name.clone(), message: format!("{e:?}"), pos, not_implemented: false };
+                        return Ok(Err((s, Some(e))));
+                    }
+                    let dex = Dex::parse(buf).with_context(|| format!("parsing {name}"))?;
+                    let add = agload::add_error(&st, &dex);
+                    let xref = if add.is_none() { agload::xref_error(&st, &dex) } else { None };
+                    return Ok(Ok((dex, add, xref)));
                 }
-                bail!("parsing {name}: {}", e.message);
-            }
-            Ok(Ok((Dex::parse(buf).with_context(|| format!("parsing {name}"))?, None, None)))
-        })
-        .collect::<Result<_>>()?;
-    let mut dexes = Vec::new();
-    let mut skipped = Vec::new();
-    let mut positions = Vec::new();
-    // androguard: DEX() then add() for each file in turn, create_xref() at
-    // the end.
-    let mut first: Option<AgErr> = None;
-    let mut xref: Option<AgErr> = None;
-    for (pos, r) in loaded.into_iter().enumerate() {
-        match r {
-            Ok((d, add, x)) => {
-                dexes.push(d);
-                positions.push(pos);
-                if first.is_none() {
-                    first = add;
+                if let Some(e) = androguard_header_check(&buf, false) {
+                    if mode == HeaderMode::Tolerant && e.skippable {
+                        return Ok(Err((SkippedDex { name: name.clone(), message: e.message, pos, not_implemented: e.not_implemented }, None)));
+                    }
+                    bail!("parsing {name}: {}", e.message);
                 }
-                if xref.is_none() {
-                    xref = x;
+                Ok(Ok((Dex::parse(buf).with_context(|| format!("parsing {name}"))?, None, None)))
+            })
+            .collect::<Result<_>>()?;
+        let mut dexes = Vec::new();
+        let mut skipped = Vec::new();
+        let mut positions = Vec::new();
+        // androguard: DEX() then add() for each file in turn, create_xref() at
+        // the end.
+        let mut first: Option<AgErr> = None;
+        let mut xref: Option<AgErr> = None;
+        for (pos, r) in loaded.into_iter().enumerate() {
+            match r {
+                Ok((d, add, x)) => {
+                    dexes.push(d);
+                    positions.push(pos);
+                    if first.is_none() {
+                        first = add;
+                    }
+                    if xref.is_none() {
+                        xref = x;
+                    }
                 }
-            }
-            Err((s, e)) => {
-                if first.is_none() {
-                    first = e;
+                Err((s, e)) => {
+                    if first.is_none() {
+                        first = e;
+                    }
+                    skipped.push(s);
                 }
-                skipped.push(s);
             }
         }
-    }
-    Ok((dexes, skipped, positions, first.or(xref)))
+        Ok((dexes, skipped, positions, first.or(xref)))
+    })
 }
 
 #[cfg(test)]

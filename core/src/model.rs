@@ -497,60 +497,62 @@ fn field_entries(dex: &Dex, ci: usize) -> Result<Vec<FieldEntry>> {
 
 impl Model {
     pub fn build(idx: &Index) -> Model {
-        let passes: Vec<DexPass> = idx.dexes.par_iter().enumerate().map(|(d, dex)| pass(idx, d as u16, dex)).collect();
-        // androguard's method table holds every definition in every DEX
-        // before create_xref() runs, so "defined" is global.
-        let defined: FxHashSet<u64> = passes.iter().flat_map(|p| p.defined.iter().copied()).collect();
-        let mut m = Model {
-            own: shared_cells(idx),
-            ext_classes: Vec::new(),
-            ext_class_set: FxHashSet::default(),
-            tails: FxHashMap::default(),
-            held: FxHashMap::default(),
-            runs: Vec::new(),
-            run_of: FxHashMap::default(),
-            runs_by_block: FxHashMap::default(),
-            run_rows: FxHashMap::default(),
-            listed: FxHashSet::default(),
-            field_access: Vec::new(),
-            field_defs: idx.dexes.iter().map(|_| OnceLock::new()).collect(),
-            name_pos: OnceLock::new(),
-        };
-        let mut seen_method = FxHashSet::default();
-        let irr = &idx.irr;
-        for (d, p) in passes.iter().enumerate() {
-            for &ev in &p.events {
-                match ev {
-                    Event::Class { hash, type_idx } => {
-                        if idx.class_def_by_hash(hash).is_none() && m.ext_class_set.insert(hash) {
-                            m.ext_classes.push((hash, d as u16, type_idx));
+        crate::pool::install(|| {
+            let passes: Vec<DexPass> = idx.dexes.par_iter().enumerate().map(|(d, dex)| pass(idx, d as u16, dex)).collect();
+            // androguard's method table holds every definition in every DEX
+            // before create_xref() runs, so "defined" is global.
+            let defined: FxHashSet<u64> = passes.iter().flat_map(|p| p.defined.iter().copied()).collect();
+            let mut m = Model {
+                own: shared_cells(idx),
+                ext_classes: Vec::new(),
+                ext_class_set: FxHashSet::default(),
+                tails: FxHashMap::default(),
+                held: FxHashMap::default(),
+                runs: Vec::new(),
+                run_of: FxHashMap::default(),
+                runs_by_block: FxHashMap::default(),
+                run_rows: FxHashMap::default(),
+                listed: FxHashSet::default(),
+                field_access: Vec::new(),
+                field_defs: idx.dexes.iter().map(|_| OnceLock::new()).collect(),
+                name_pos: OnceLock::new(),
+            };
+            let mut seen_method = FxHashSet::default();
+            let irr = &idx.irr;
+            for (d, p) in passes.iter().enumerate() {
+                for &ev in &p.events {
+                    match ev {
+                        Event::Class { hash, type_idx } => {
+                            if idx.class_def_by_hash(hash).is_none() && m.ext_class_set.insert(hash) {
+                                m.ext_classes.push((hash, d as u16, type_idx));
+                            }
                         }
-                    }
-                    Event::Method { class, sig, midx, ext } => {
-                        if (ext || !defined.contains(&sig)) && seen_method.insert(sig) {
-                            m.tails.entry(class).or_default().push(Tail::External(d as u16, midx));
+                        Event::Method { class, sig, midx, ext } => {
+                            if (ext || !defined.contains(&sig)) && seen_method.insert(sig) {
+                                m.tails.entry(class).or_default().push(Tail::External(d as u16, midx));
+                            }
                         }
-                    }
-                    Event::Caller { name, e } => m.hold(idx, name, e, irr.ma_star(e)),
-                    Event::Callee { slot } => {
-                        let s = &irr.slots[slot as usize];
-                        m.hold(idx, s.name, s.em, irregular::key(s.j, s.em));
-                    }
-                    Event::Run { name, block } => {
-                        let excluded: Vec<u32> =
-                            irr.em_range(block).filter(|&e| irr.ems[e as usize].calls && m.held.contains_key(&(name, e))).collect();
-                        let r = m.runs.len() as u32;
-                        m.runs.push(RunRec { block, excluded });
-                        m.run_of.insert((name, block), r);
-                        m.runs_by_block.entry(block).or_default().push(r);
-                        m.tails.entry(irr.names[name as usize].hash).or_default().push(Tail::Run(r));
+                        Event::Caller { name, e } => m.hold(idx, name, e, irr.ma_star(e)),
+                        Event::Callee { slot } => {
+                            let s = &irr.slots[slot as usize];
+                            m.hold(idx, s.name, s.em, irregular::key(s.j, s.em));
+                        }
+                        Event::Run { name, block } => {
+                            let excluded: Vec<u32> =
+                                irr.em_range(block).filter(|&e| irr.ems[e as usize].calls && m.held.contains_key(&(name, e))).collect();
+                            let r = m.runs.len() as u32;
+                            m.runs.push(RunRec { block, excluded });
+                            m.run_of.insert((name, block), r);
+                            m.runs_by_block.entry(block).or_default().push(r);
+                            m.tails.entry(irr.names[name as usize].hash).or_default().push(Tail::Run(r));
+                        }
                     }
                 }
             }
-        }
-        m.field_access = passes.into_iter().map(|p| p.fields).collect();
-        m.run_rows = m.runs.iter().filter(|r| r.excluded.is_empty()).map(|r| (r.block, OnceLock::new())).collect();
-        m
+            m.field_access = passes.into_iter().map(|p| p.fields).collect();
+            m.run_rows = m.runs.iter().filter(|r| r.excluded.is_empty()).map(|r| (r.block, OnceLock::new())).collect();
+            m
+        })
     }
 
     /// create_xref() lists MethodAnalysis `k` (of EncodedMethod `e`) in the
@@ -928,79 +930,81 @@ pub fn const_strings(
     jumbo: bool,
     extra: &(dyn Fn(u64) -> Vec<TailSeg> + Sync),
 ) -> Vec<(String, Vec<Arc<Vec<MethodStrings>>>)> {
-    let method = |dex: &Dex, midx: u32, code: &[u8]| -> Option<MethodStrings> {
-        let r = AgResolver { dex };
-        let mut dec = Decoder::new(code);
-        let offs: Vec<u32> =
-            (&mut dec).filter(|i| i.payload == 0 && (i.op == 0x1a || (jumbo && i.op == 0x1b))).map(|i| i.off).collect();
-        if dec.invalid || offs.is_empty() {
-            return None;
-        }
-        let outs: Vec<String> = offs
-            .iter()
-            .filter_map(|&off| dex_bytecode::decode_one_with_resolver(code, off as usize, &r).ok())
-            .map(|i| i.operands)
-            .collect();
-        let (name, desc) = r.method_name_and_desc(midx);
-        Some((name, desc, outs))
-    };
-    let scan = |dex: &Dex, off: u32| -> Vec<MethodStrings> {
-        let Ok(data) = dex.class_data(off) else { return Vec::new() };
-        data.direct_methods
-            .iter()
-            .chain(&data.virtual_methods)
-            .filter_map(|m| method(dex, m.idx, dex.code(m.code_off).ok()?))
-            .collect()
-    };
-    let cells: SharedCells<Vec<MethodStrings>> = shared_cells(idx);
-    let classes: Vec<(u16, &Dex, usize)> = idx.classes_in_order().collect();
-    let ems_rows = |ems: &mut dyn Iterator<Item = u32>| -> Vec<MethodStrings> {
-        ems.filter_map(|e| {
-            let (ndex, midx, code_off) = idx.em_code(e)?;
-            method(ndex, midx, ndex.code(code_off).ok()?)
-        })
-        .collect()
-    };
-    // What create_xref() appended to each irregular class; a class_data
-    // appended whole is rendered once for every class it is in.
-    let tails: FxHashMap<u64, Vec<TailSeg>> = if idx.irr.active() {
-        classes
-            .iter()
-            .filter_map(|&(_, dex, ci)| {
-                let h = sig_hash(dex.type_desc(dex.class_def(ci).ok()?.class_idx).ok()?);
-                idx.irr.name_of_hash(h).map(|_| (h, extra(h)))
+    crate::pool::install(|| {
+        let method = |dex: &Dex, midx: u32, code: &[u8]| -> Option<MethodStrings> {
+            let r = AgResolver { dex };
+            let mut dec = Decoder::new(code);
+            let offs: Vec<u32> =
+                (&mut dec).filter(|i| i.payload == 0 && (i.op == 0x1a || (jumbo && i.op == 0x1b))).map(|i| i.off).collect();
+            if dec.invalid || offs.is_empty() {
+                return None;
+            }
+            let outs: Vec<String> = offs
+                .iter()
+                .filter_map(|&off| dex_bytecode::decode_one_with_resolver(code, off as usize, &r).ok())
+                .map(|i| i.operands)
+                .collect();
+            let (name, desc) = r.method_name_and_desc(midx);
+            Some((name, desc, outs))
+        };
+        let scan = |dex: &Dex, off: u32| -> Vec<MethodStrings> {
+            let Ok(data) = dex.class_data(off) else { return Vec::new() };
+            data.direct_methods
+                .iter()
+                .chain(&data.virtual_methods)
+                .filter_map(|m| method(dex, m.idx, dex.code(m.code_off).ok()?))
+                .collect()
+        };
+        let cells: SharedCells<Vec<MethodStrings>> = shared_cells(idx);
+        let classes: Vec<(u16, &Dex, usize)> = idx.classes_in_order().collect();
+        let ems_rows = |ems: &mut dyn Iterator<Item = u32>| -> Vec<MethodStrings> {
+            ems.filter_map(|e| {
+                let (ndex, midx, code_off) = idx.em_code(e)?;
+                method(ndex, midx, ndex.code(code_off).ok()?)
             })
             .collect()
-    } else {
-        FxHashMap::default()
-    };
-    let runs: FxHashMap<u32, OnceLock<Arc<Vec<MethodStrings>>>> = tails
-        .values()
-        .flatten()
-        .filter_map(|s| match s {
-            TailSeg::Block(b) => Some((*b, OnceLock::new())),
-            TailSeg::Ems(_) => None,
-        })
-        .collect();
-    classes
-        .par_iter()
-        .filter_map(|&(d, dex, ci)| {
-            let cd = dex.class_def(ci).ok()?;
-            let mut chunks = Vec::new();
-            if dex.has_class_data(cd.class_data_off) {
-                chunks.push(rendered(&cells, d, cd.class_data_off, || scan(dex, cd.class_data_off)).0);
-            }
-            let h = sig_hash(dex.type_desc(cd.class_idx).ok()?);
-            for seg in tails.get(&h).map(Vec::as_slice).unwrap_or_default() {
-                chunks.push(match seg {
-                    TailSeg::Ems(ems) => Arc::new(ems_rows(&mut ems.iter().map(|&(e, _)| e))),
-                    TailSeg::Block(b) => runs[b].get_or_init(|| Arc::new(ems_rows(&mut idx.run_ems(*b)))).clone(),
-                });
-            }
-            chunks.retain(|c| !c.is_empty());
-            (!chunks.is_empty()).then(|| (AgResolver { dex }.type_name(cd.class_idx), chunks))
-        })
-        .collect()
+        };
+        // What create_xref() appended to each irregular class; a class_data
+        // appended whole is rendered once for every class it is in.
+        let tails: FxHashMap<u64, Vec<TailSeg>> = if idx.irr.active() {
+            classes
+                .iter()
+                .filter_map(|&(_, dex, ci)| {
+                    let h = sig_hash(dex.type_desc(dex.class_def(ci).ok()?.class_idx).ok()?);
+                    idx.irr.name_of_hash(h).map(|_| (h, extra(h)))
+                })
+                .collect()
+        } else {
+            FxHashMap::default()
+        };
+        let runs: FxHashMap<u32, OnceLock<Arc<Vec<MethodStrings>>>> = tails
+            .values()
+            .flatten()
+            .filter_map(|s| match s {
+                TailSeg::Block(b) => Some((*b, OnceLock::new())),
+                TailSeg::Ems(_) => None,
+            })
+            .collect();
+        classes
+            .par_iter()
+            .filter_map(|&(d, dex, ci)| {
+                let cd = dex.class_def(ci).ok()?;
+                let mut chunks = Vec::new();
+                if dex.has_class_data(cd.class_data_off) {
+                    chunks.push(rendered(&cells, d, cd.class_data_off, || scan(dex, cd.class_data_off)).0);
+                }
+                let h = sig_hash(dex.type_desc(cd.class_idx).ok()?);
+                for seg in tails.get(&h).map(Vec::as_slice).unwrap_or_default() {
+                    chunks.push(match seg {
+                        TailSeg::Ems(ems) => Arc::new(ems_rows(&mut ems.iter().map(|&(e, _)| e))),
+                        TailSeg::Block(b) => runs[b].get_or_init(|| Arc::new(ems_rows(&mut idx.run_ems(*b)))).clone(),
+                    });
+                }
+                chunks.retain(|c| !c.is_empty());
+                (!chunks.is_empty()).then(|| (AgResolver { dex }.type_name(cd.class_idx), chunks))
+            })
+            .collect()
+    })
 }
 
 #[cfg(test)]

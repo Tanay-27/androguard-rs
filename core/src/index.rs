@@ -359,84 +359,86 @@ pub struct Index {
 
 impl Index {
     pub fn build(dexes: Vec<Dex>) -> Result<Index> {
-        let class_lists: Vec<Vec<(u64, u32)>> = dexes.par_iter().map(class_list).collect();
-        let mhashes: Vec<Vec<u64>> =
-            dexes.par_iter().map(|dex| (0..dex.method_count() as u32).map(|i| method_hash(dex, i)).collect()).collect();
-        let mut class_defs: FxHashMap<u64, (u16, u32)> = FxHashMap::default();
-        let mut class_order: Vec<u64> = Vec::new();
-        let mut irregular: FxHashSet<u64> = FxHashSet::default();
-        for (d, list) in class_lists.iter().enumerate() {
-            for &(h, ci) in list {
-                if class_defs.insert(h, (d as u16, ci)).is_none() {
-                    class_order.push(h);
-                } else {
-                    irregular.insert(h);
+        crate::pool::install(|| {
+            let class_lists: Vec<Vec<(u64, u32)>> = dexes.par_iter().map(class_list).collect();
+            let mhashes: Vec<Vec<u64>> =
+                dexes.par_iter().map(|dex| (0..dex.method_count() as u32).map(|i| method_hash(dex, i)).collect()).collect();
+            let mut class_defs: FxHashMap<u64, (u16, u32)> = FxHashMap::default();
+            let mut class_order: Vec<u64> = Vec::new();
+            let mut irregular: FxHashSet<u64> = FxHashSet::default();
+            for (d, list) in class_lists.iter().enumerate() {
+                for &(h, ci) in list {
+                    if class_defs.insert(h, (d as u16, ci)).is_none() {
+                        class_order.push(h);
+                    } else {
+                        irregular.insert(h);
+                    }
                 }
             }
-        }
-        let flagged: Vec<Vec<u64>> = dexes
-            .par_iter()
-            .zip(&class_lists)
-            .zip(&mhashes)
-            .map(|((dex, list), mhash)| irregular::flagged(dex, list, mhash))
-            .collect();
-        irregular.extend(flagged.into_iter().flatten());
-        let mut irr = if irregular.is_empty() { Irr::default() } else { Irr::build(&dexes, &class_lists, &irregular) };
-        // Irregular classes are scanned apart, per class_data (scan_irregular).
-        let skip: Vec<FxHashSet<u32>> = class_lists
-            .iter()
-            .map(|l| l.iter().filter(|(h, _)| irregular.contains(h)).map(|&(_, ci)| ci).collect())
-            .collect();
-        let scans: Vec<DexScan> = dexes
-            .par_iter()
-            .zip(&skip)
-            .zip(mhashes)
-            .map(|((dex, skip), mhash)| scan(dex, skip, mhash))
-            .collect::<Result<_>>()?;
-        drop(skip);
+            let flagged: Vec<Vec<u64>> = dexes
+                .par_iter()
+                .zip(&class_lists)
+                .zip(&mhashes)
+                .map(|((dex, list), mhash)| irregular::flagged(dex, list, mhash))
+                .collect();
+            irregular.extend(flagged.into_iter().flatten());
+            let mut irr = if irregular.is_empty() { Irr::default() } else { Irr::build(&dexes, &class_lists, &irregular) };
+            // Irregular classes are scanned apart, per class_data (scan_irregular).
+            let skip: Vec<FxHashSet<u32>> = class_lists
+                .iter()
+                .map(|l| l.iter().filter(|(h, _)| irregular.contains(h)).map(|&(_, ci)| ci).collect())
+                .collect();
+            let scans: Vec<DexScan> = dexes
+                .par_iter()
+                .zip(&skip)
+                .zip(mhashes)
+                .map(|((dex, skip), mhash)| scan(dex, skip, mhash))
+                .collect::<Result<_>>()?;
+            drop(skip);
 
-        let mut g = Gids { map: FxHashMap::default(), rep: Vec::new(), def: Vec::new() };
-        let mut stats = Stats::default();
-        let n_edges: usize = scans.iter().map(|s| s.edges.len()).sum();
-        let mut edges: Vec<[u32; 3]> = Vec::with_capacity(n_edges);
-        for (d, s) in scans.iter().enumerate() {
-            stats.add(&s.stats);
-            for &(midx, code_off) in &s.defs {
-                let n = g.get(s.mhash[midx as usize], d as u16, midx) as usize;
-                // Render from the defining DEX, not wherever it was first referenced.
-                g.rep[n] = (d as u16, midx);
-                g.def[n] = Some((d as u16, code_off));
-            }
-            for &[caller, callee, off] in &s.edges {
-                let gc = g.get(s.mhash[caller as usize], d as u16, caller);
-                let ge = callee_node(&dexes, &mut irr, &mut g, &s.mhash, d as u16, callee);
-                edges.push([gc, ge, off]);
-            }
-        }
-        // Remap string refs' callers to gids too, so string search answers in gids.
-        let mut string_refs: Vec<Vec<[u32; 2]>> = scans
-            .iter()
-            .map(|s| s.string_refs.iter().map(|&[sidx, caller]| [sidx, g.map[&s.mhash[caller as usize]]]).collect())
-            .collect();
-        if irr.active() {
-            let mut extra: Vec<Vec<[u32; 2]>> = dexes.iter().map(|_| Vec::new()).collect();
-            scan_irregular(&dexes, &scans, &mut irr, &mut g, &mut edges, &mut extra, &mut stats);
-            for (refs, extra) in string_refs.iter_mut().zip(extra) {
-                if !extra.is_empty() {
-                    refs.extend(extra);
-                    refs.sort_unstable();
+            let mut g = Gids { map: FxHashMap::default(), rep: Vec::new(), def: Vec::new() };
+            let mut stats = Stats::default();
+            let n_edges: usize = scans.iter().map(|s| s.edges.len()).sum();
+            let mut edges: Vec<[u32; 3]> = Vec::with_capacity(n_edges);
+            for (d, s) in scans.iter().enumerate() {
+                stats.add(&s.stats);
+                for &(midx, code_off) in &s.defs {
+                    let n = g.get(s.mhash[midx as usize], d as u16, midx) as usize;
+                    // Render from the defining DEX, not wherever it was first referenced.
+                    g.rep[n] = (d as u16, midx);
+                    g.def[n] = Some((d as u16, code_off));
+                }
+                for &[caller, callee, off] in &s.edges {
+                    let gc = g.get(s.mhash[caller as usize], d as u16, caller);
+                    let ge = callee_node(&dexes, &mut irr, &mut g, &s.mhash, d as u16, callee);
+                    edges.push([gc, ge, off]);
                 }
             }
-        }
-        drop(scans);
-        drop(class_lists);
+            // Remap string refs' callers to gids too, so string search answers in gids.
+            let mut string_refs: Vec<Vec<[u32; 2]>> = scans
+                .iter()
+                .map(|s| s.string_refs.iter().map(|&[sidx, caller]| [sidx, g.map[&s.mhash[caller as usize]]]).collect())
+                .collect();
+            if irr.active() {
+                let mut extra: Vec<Vec<[u32; 2]>> = dexes.iter().map(|_| Vec::new()).collect();
+                scan_irregular(&dexes, &scans, &mut irr, &mut g, &mut edges, &mut extra, &mut stats);
+                for (refs, extra) in string_refs.iter_mut().zip(extra) {
+                    if !extra.is_empty() {
+                        refs.extend(extra);
+                        refs.sort_unstable();
+                    }
+                }
+            }
+            drop(scans);
+            drop(class_lists);
 
-        let Gids { map: sig_to_gid, rep, def } = g;
-        let n = rep.len();
-        let callees = Csr::build(n, &edges, 0, 1);
-        let callers = Csr::build(n, &edges, 1, 0);
-        drop(edges);
-        Ok(Index { dexes, sig_to_gid, rep, def, class_defs, class_order, irr, callees, callers, string_refs, stats })
+            let Gids { map: sig_to_gid, rep, def } = g;
+            let n = rep.len();
+            let callees = Csr::build(n, &edges, 0, 1);
+            let callers = Csr::build(n, &edges, 1, 0);
+            drop(edges);
+            Ok(Index { dexes, sig_to_gid, rep, def, class_defs, class_order, irr, callees, callers, string_refs, stats })
+        })
     }
 
     pub fn method_count(&self) -> usize {
@@ -542,31 +544,33 @@ impl Index {
     /// as UTF-8 (lone surrogates as WTF-8), so a byte match is a code-point
     /// substring match.
     pub fn methods_using_string(&self, needle: &[u8]) -> (usize, Vec<u32>) {
-        let finder = memchr::memmem::Finder::new(needle);
-        let per_dex: Vec<(usize, Vec<u32>)> = self
-            .dexes
-            .par_iter()
-            .zip(self.string_refs.par_iter())
-            .map(|(dex, refs)| {
-                let mut hits = 0;
-                let mut methods = Vec::new();
-                let mut i = 0;
-                while i < refs.len() {
-                    let sidx = refs[i][0];
-                    let j = i + refs[i..].partition_point(|r| r[0] == sidx);
-                    if string_text_contains(dex, sidx, &finder) {
-                        hits += 1;
-                        methods.extend(refs[i..j].iter().map(|r| r[1]));
+        crate::pool::install(|| {
+            let finder = memchr::memmem::Finder::new(needle);
+            let per_dex: Vec<(usize, Vec<u32>)> = self
+                .dexes
+                .par_iter()
+                .zip(self.string_refs.par_iter())
+                .map(|(dex, refs)| {
+                    let mut hits = 0;
+                    let mut methods = Vec::new();
+                    let mut i = 0;
+                    while i < refs.len() {
+                        let sidx = refs[i][0];
+                        let j = i + refs[i..].partition_point(|r| r[0] == sidx);
+                        if string_text_contains(dex, sidx, &finder) {
+                            hits += 1;
+                            methods.extend(refs[i..j].iter().map(|r| r[1]));
+                        }
+                        i = j;
                     }
-                    i = j;
-                }
-                (hits, methods)
-            })
-            .collect();
-        let mut methods: Vec<u32> = per_dex.iter().flat_map(|(_, m)| m.iter().copied()).collect();
-        methods.sort_unstable();
-        methods.dedup();
-        (per_dex.iter().map(|(h, _)| h).sum(), methods)
+                    (hits, methods)
+                })
+                .collect();
+            let mut methods: Vec<u32> = per_dex.iter().flat_map(|(_, m)| m.iter().copied()).collect();
+            methods.sort_unstable();
+            methods.dedup();
+            (per_dex.iter().map(|(h, _)| h).sum(), methods)
+        })
     }
 
     /// Methods whose instruction text contains any of `needles`, in
@@ -591,91 +595,93 @@ impl Index {
         needles: &[String],
         extra: &(dyn Fn(u64) -> Vec<TailSeg> + Sync),
     ) -> Vec<ClassHits> {
-        let hit = |dex: &Dex, code: &[u8]| -> bool {
-            let resolver = AgResolver { dex };
-            // A method androguard can't disassemble contributes nothing.
-            let Ok(insns) = dex_bytecode::decode_all_with_resolver(code, 0, &resolver) else { return false };
-            insns.iter().any(|i| {
-                if i.output_is_none || i.operands.is_empty() {
-                    return false;
+        crate::pool::install(|| {
+            let hit = |dex: &Dex, code: &[u8]| -> bool {
+                let resolver = AgResolver { dex };
+                // A method androguard can't disassemble contributes nothing.
+                let Ok(insns) = dex_bytecode::decode_all_with_resolver(code, 0, &resolver) else { return false };
+                insns.iter().any(|i| {
+                    if i.output_is_none || i.operands.is_empty() {
+                        return false;
+                    }
+                    let text = py_lower(&i.operands);
+                    needles.iter().any(|n| text.contains(n.as_str()))
+                })
+            };
+            let search = |d: u16, dex: &Dex, off: u32| -> Vec<Hit> {
+                let mut hits = Vec::new();
+                let Ok(data) = dex.class_data(off) else { return hits };
+                let block = self.irr.block_at(d, off);
+                for (pos, m) in data.direct_methods.iter().chain(&data.virtual_methods).enumerate() {
+                    // No declared code_item: no code.
+                    let Ok(code) = dex.code(m.code_off) else { continue };
+                    if hit(dex, code) {
+                        let key = match block {
+                            Some(b) => HitKey::Pos(self.irr.em_range(b).start + pos as u32),
+                            None => HitKey::Sig,
+                        };
+                        hits.push((dex.method_sig(m.idx).unwrap_or_default(), key));
+                    }
                 }
-                let text = py_lower(&i.operands);
-                needles.iter().any(|n| text.contains(n.as_str()))
-            })
-        };
-        let search = |d: u16, dex: &Dex, off: u32| -> Vec<Hit> {
-            let mut hits = Vec::new();
-            let Ok(data) = dex.class_data(off) else { return hits };
-            let block = self.irr.block_at(d, off);
-            for (pos, m) in data.direct_methods.iter().chain(&data.virtual_methods).enumerate() {
-                // No declared code_item: no code.
-                let Ok(code) = dex.code(m.code_off) else { continue };
-                if hit(dex, code) {
-                    let key = match block {
-                        Some(b) => HitKey::Pos(self.irr.em_range(b).start + pos as u32),
-                        None => HitKey::Sig,
-                    };
-                    hits.push((dex.method_sig(m.idx).unwrap_or_default(), key));
+                hits
+            };
+            let ems_hits = |ems: &mut dyn Iterator<Item = (u32, u64)>| -> Vec<Hit> {
+                let mut out = Vec::new();
+                for (e, key) in ems {
+                    let Some((dex, midx, code_off)) = self.em_code(e) else { continue };
+                    if dex.code(code_off).is_ok_and(|code| hit(dex, code)) {
+                        out.push((dex.method_sig(midx).unwrap_or_default(), HitKey::Full(key)));
+                    }
                 }
-            }
-            hits
-        };
-        let ems_hits = |ems: &mut dyn Iterator<Item = (u32, u64)>| -> Vec<Hit> {
-            let mut out = Vec::new();
-            for (e, key) in ems {
-                let Some((dex, midx, code_off)) = self.em_code(e) else { continue };
-                if dex.code(code_off).is_ok_and(|code| hit(dex, code)) {
-                    out.push((dex.method_sig(midx).unwrap_or_default(), HitKey::Full(key)));
-                }
-            }
-            out
-        };
-        let shared: FxHashMap<(usize, u32), OnceLock<Arc<Vec<Hit>>>> = self
-            .dexes
-            .iter()
-            .enumerate()
-            .flat_map(|(d, dex)| dex.memo.shared_class_data().map(move |off| ((d, off), OnceLock::new())))
-            .collect();
-        // What create_xref() appended to each irregular class, and a cell per
-        // class_data appended whole (searched once for every class it is in).
-        let tails: FxHashMap<u64, Vec<TailSeg>> = if self.irr.active() {
-            self.class_order.iter().filter(|h| self.irr.name_of_hash(**h).is_some()).map(|&h| (h, extra(h))).collect()
-        } else {
-            FxHashMap::default()
-        };
-        let runs: FxHashMap<u32, OnceLock<Arc<Vec<Hit>>>> = tails
-            .values()
-            .flatten()
-            .filter_map(|s| match s {
-                TailSeg::Block(b) => Some((*b, OnceLock::new())),
-                TailSeg::Ems(_) => None,
-            })
-            .collect();
-        self.class_order
-            .par_iter()
-            .filter_map(|h| {
-                let &(d, ci) = self.class_defs.get(h)?;
-                let dex = &self.dexes[d as usize];
-                let cd = dex.class_def(ci as usize).ok()?;
-                let mut chunks = Vec::new();
-                if dex.has_class_data(cd.class_data_off) {
-                    chunks.push(match shared.get(&(d as usize, cd.class_data_off)) {
-                        Some(cell) => cell.get_or_init(|| Arc::new(search(d, dex, cd.class_data_off))).clone(),
-                        None => Arc::new(search(d, dex, cd.class_data_off)),
-                    });
-                }
-                for seg in tails.get(h).map(Vec::as_slice).unwrap_or_default() {
-                    chunks.push(match seg {
-                        TailSeg::Ems(ems) => Arc::new(ems_hits(&mut ems.iter().copied())),
-                        TailSeg::Block(b) => runs[b]
-                            .get_or_init(|| Arc::new(ems_hits(&mut self.run_ems(*b).map(|e| (e, self.irr.ma_star(e))))))
-                            .clone(),
-                    });
-                }
-                chunks.retain(|c| !c.is_empty());
-                (!chunks.is_empty()).then_some(((d, ci), chunks))
-            })
-            .collect()
+                out
+            };
+            let shared: FxHashMap<(usize, u32), OnceLock<Arc<Vec<Hit>>>> = self
+                .dexes
+                .iter()
+                .enumerate()
+                .flat_map(|(d, dex)| dex.memo.shared_class_data().map(move |off| ((d, off), OnceLock::new())))
+                .collect();
+            // What create_xref() appended to each irregular class, and a cell per
+            // class_data appended whole (searched once for every class it is in).
+            let tails: FxHashMap<u64, Vec<TailSeg>> = if self.irr.active() {
+                self.class_order.iter().filter(|h| self.irr.name_of_hash(**h).is_some()).map(|&h| (h, extra(h))).collect()
+            } else {
+                FxHashMap::default()
+            };
+            let runs: FxHashMap<u32, OnceLock<Arc<Vec<Hit>>>> = tails
+                .values()
+                .flatten()
+                .filter_map(|s| match s {
+                    TailSeg::Block(b) => Some((*b, OnceLock::new())),
+                    TailSeg::Ems(_) => None,
+                })
+                .collect();
+            self.class_order
+                .par_iter()
+                .filter_map(|h| {
+                    let &(d, ci) = self.class_defs.get(h)?;
+                    let dex = &self.dexes[d as usize];
+                    let cd = dex.class_def(ci as usize).ok()?;
+                    let mut chunks = Vec::new();
+                    if dex.has_class_data(cd.class_data_off) {
+                        chunks.push(match shared.get(&(d as usize, cd.class_data_off)) {
+                            Some(cell) => cell.get_or_init(|| Arc::new(search(d, dex, cd.class_data_off))).clone(),
+                            None => Arc::new(search(d, dex, cd.class_data_off)),
+                        });
+                    }
+                    for seg in tails.get(h).map(Vec::as_slice).unwrap_or_default() {
+                        chunks.push(match seg {
+                            TailSeg::Ems(ems) => Arc::new(ems_hits(&mut ems.iter().copied())),
+                            TailSeg::Block(b) => runs[b]
+                                .get_or_init(|| Arc::new(ems_hits(&mut self.run_ems(*b).map(|e| (e, self.irr.ma_star(e))))))
+                                .clone(),
+                        });
+                    }
+                    chunks.retain(|c| !c.is_empty());
+                    (!chunks.is_empty()).then_some(((d, ci), chunks))
+                })
+                .collect()
+        })
     }
 
     /// The EncodedMethods of irregular class_data `b` that make calls (what a

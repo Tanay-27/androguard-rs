@@ -123,9 +123,9 @@ and mutf8 versions output parity is defined against, and check it against
 `SHA256SUMS`:
 
 ```sh
-gh release download v0.1.2 --repo Tanay-27/androguard-rs --pattern '*.whl' --pattern SHA256SUMS
+gh release download v0.1.3 --repo Tanay-27/androguard-rs --pattern '*.whl' --pattern SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
-pip install ./androguard_rs-0.1.2-*.whl
+pip install ./androguard_rs-0.1.3-*.whl
 python -c "import androguard_rs; print(androguard_rs.__file__)"
 ```
 

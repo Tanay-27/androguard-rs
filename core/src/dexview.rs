@@ -226,25 +226,27 @@ pub fn methods_referencing(
     rules: &[OutputRule],
     include_unreadable: bool,
 ) -> Result<Vec<(u32, u32)>> {
-    use rayon::prelude::*;
-    let per_class: Vec<Result<Vec<(u32, u32)>>> = (0..dex.class_count())
-        .into_par_iter()
-        .map(|ci| {
-            let members = class_members(dex, ci)?;
-            let mut hits = Vec::new();
-            for (pos, m) in members.methods.iter().enumerate() {
-                if names.contains(&m.name) || (m.has_code && code_matches(dex, m.code_off, rules, include_unreadable)) {
-                    hits.push((ci as u32, pos as u32));
+    crate::pool::install(|| {
+        use rayon::prelude::*;
+        let per_class: Vec<Result<Vec<(u32, u32)>>> = (0..dex.class_count())
+            .into_par_iter()
+            .map(|ci| {
+                let members = class_members(dex, ci)?;
+                let mut hits = Vec::new();
+                for (pos, m) in members.methods.iter().enumerate() {
+                    if names.contains(&m.name) || (m.has_code && code_matches(dex, m.code_off, rules, include_unreadable)) {
+                        hits.push((ci as u32, pos as u32));
+                    }
                 }
-            }
-            Ok(hits)
-        })
-        .collect();
-    let mut out = Vec::new();
-    for r in per_class {
-        out.extend(r?);
-    }
-    Ok(out)
+                Ok(hits)
+            })
+            .collect();
+        let mut out = Vec::new();
+        for r in per_class {
+            out.extend(r?);
+        }
+        Ok(out)
+    })
 }
 
 fn code_matches(dex: &Dex, code_off: u64, rules: &[OutputRule], include_unreadable: bool) -> bool {

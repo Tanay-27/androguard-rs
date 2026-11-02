@@ -868,48 +868,50 @@ pub fn add_error_no_map() -> AgErr {
 /// What `Analysis.add(vm)` raises for this DEX, if anything. `dex` is the
 /// native reader over the same bytes (for the instruction decoders).
 pub fn add_error(st: &AgState, dex: &Dex) -> Option<AgErr> {
-    if st.no_map {
-        return Some(add_error_no_map());
-    }
-    let data = &dex.data[..];
-    // Methods and codes in add() order, each class_data once (shared ones
-    // are the same objects, already loaded and analysed).
-    let mut seen_data = FxHashSet::default();
-    // (class number, code_off) in order, to decode in parallel.
-    let mut order: Vec<(usize, u64)> = Vec::new();
-    let mut first_err: Option<(usize, AgErr)> = None;
-    'classes: for (i, &cd) in st.classes.iter().enumerate() {
-        if let Some(n) = st.hidden_flags {
-            if i as u64 >= n {
-                first_err = Some((i, AgErr::IndexList));
-                break;
+    crate::pool::install(|| {
+        if st.no_map {
+            return Some(add_error_no_map());
+        }
+        let data = &dex.data[..];
+        // Methods and codes in add() order, each class_data once (shared ones
+        // are the same objects, already loaded and analysed).
+        let mut seen_data = FxHashSet::default();
+        // (class number, code_off) in order, to decode in parallel.
+        let mut order: Vec<(usize, u64)> = Vec::new();
+        let mut first_err: Option<(usize, AgErr)> = None;
+        'classes: for (i, &cd) in st.classes.iter().enumerate() {
+            if let Some(n) = st.hidden_flags {
+                if i as u64 >= n {
+                    first_err = Some((i, AgErr::IndexList));
+                    break;
+                }
+            }
+            if !st.has_class_data(cd) || !seen_data.insert(cd) {
+                continue;
+            }
+            for (_, code_off) in class_methods(data, cd) {
+                if !st.has(METHOD_ID_ITEM) {
+                    first_err = Some((i, AgErr::KeyMap(METHOD_ID_ITEM)));
+                    break 'classes;
+                }
+                if st.has_code(code_off) {
+                    order.push((i, code_off));
+                }
             }
         }
-        if !st.has_class_data(cd) || !seen_data.insert(cd) {
-            continue;
+        // Code errors (instructions, then try/catch) before `first_err`'s class
+        // win; within a class, in method order.
+        let limit = first_err.as_ref().map(|e| e.0).unwrap_or(usize::MAX);
+        let mut seen_code = FxHashSet::default();
+        let todo: Vec<(usize, u64)> = order.into_iter().filter(|o| o.0 <= limit && seen_code.insert(o.1)).collect();
+        use rayon::prelude::*;
+        let code_err = todo.par_iter().find_map_first(|&(i, off)| code_error(st, dex, off).map(|e| (i, e)));
+        match (code_err, first_err) {
+            (Some(c), Some(f)) => Some(if c.0 < f.0 || (c.0 == f.0 && !matches!(f.1, AgErr::IndexList)) { c.1 } else { f.1 }),
+            (Some(c), None) => Some(c.1),
+            (None, f) => f.map(|f| f.1),
         }
-        for (_, code_off) in class_methods(data, cd) {
-            if !st.has(METHOD_ID_ITEM) {
-                first_err = Some((i, AgErr::KeyMap(METHOD_ID_ITEM)));
-                break 'classes;
-            }
-            if st.has_code(code_off) {
-                order.push((i, code_off));
-            }
-        }
-    }
-    // Code errors (instructions, then try/catch) before `first_err`'s class
-    // win; within a class, in method order.
-    let limit = first_err.as_ref().map(|e| e.0).unwrap_or(usize::MAX);
-    let mut seen_code = FxHashSet::default();
-    let todo: Vec<(usize, u64)> = order.into_iter().filter(|o| o.0 <= limit && seen_code.insert(o.1)).collect();
-    use rayon::prelude::*;
-    let code_err = todo.par_iter().find_map_first(|&(i, off)| code_error(st, dex, off).map(|e| (i, e)));
-    match (code_err, first_err) {
-        (Some(c), Some(f)) => Some(if c.0 < f.0 || (c.0 == f.0 && !matches!(f.1, AgErr::IndexList)) { c.1 } else { f.1 }),
-        (Some(c), None) => Some(c.1),
-        (None, f) => f.map(|f| f.1),
-    }
+    })
 }
 
 /// What `MethodAnalysis` raises for the code at `off`: the linear sweep

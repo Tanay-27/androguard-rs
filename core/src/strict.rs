@@ -25,31 +25,33 @@ use crate::render::AgResolver;
 /// A code_item running past the end of the DEX is skipped, as the index
 /// skips it (see README, "Truncated code items").
 pub fn first_invalid(dexes: &[Dex]) -> Option<(usize, usize, usize, u32, dex_bytecode::DexError)> {
-    // Validity of each distinct code_item, decoded in parallel with the
-    // index's decoder (the decode fuzzer checks it agrees with the
-    // formatting decoder on validity).
-    let per_dex: Vec<Vec<(usize, usize, u32)>> = dexes.iter().map(code_order).collect();
-    let found = per_dex.par_iter().enumerate().find_map_first(|(d, order)| {
+    crate::pool::install(|| {
+        // Validity of each distinct code_item, decoded in parallel with the
+        // index's decoder (the decode fuzzer checks it agrees with the
+        // formatting decoder on validity).
+        let per_dex: Vec<Vec<(usize, usize, u32)>> = dexes.iter().map(code_order).collect();
+        let found = per_dex.par_iter().enumerate().find_map_first(|(d, order)| {
+            let dex = &dexes[d];
+            let mut seen = FxHashSet::default();
+            let offs: Vec<u32> = order.iter().map(|o| o.2).filter(|o| seen.insert(*o)).collect();
+            let bad: FxHashSet<u32> = offs
+                .par_iter()
+                .filter(|&&off| {
+                    let Ok(code) = dex.code(off) else { return false };
+                    let mut dec = Decoder::new(code);
+                    for _ in &mut dec {}
+                    dec.invalid
+                })
+                .copied()
+                .collect();
+            order.iter().find(|o| bad.contains(&o.2)).map(|&(ci, pos, off)| (d, ci, pos, off))
+        })?;
+        let (d, ci, pos, off) = found;
         let dex = &dexes[d];
-        let mut seen = FxHashSet::default();
-        let offs: Vec<u32> = order.iter().map(|o| o.2).filter(|o| seen.insert(*o)).collect();
-        let bad: FxHashSet<u32> = offs
-            .par_iter()
-            .filter(|&&off| {
-                let Ok(code) = dex.code(off) else { return false };
-                let mut dec = Decoder::new(code);
-                for _ in &mut dec {}
-                dec.invalid
-            })
-            .copied()
-            .collect();
-        order.iter().find(|o| bad.contains(&o.2)).map(|&(ci, pos, off)| (d, ci, pos, off))
-    })?;
-    let (d, ci, pos, off) = found;
-    let dex = &dexes[d];
-    let code = dex.code(off).ok()?;
-    let err = dex_bytecode::decode_all_with_resolver(code, 0, &AgResolver { dex }).err()?;
-    Some((d, ci, pos, off, err))
+        let code = dex.code(off).ok()?;
+        let err = dex_bytecode::decode_all_with_resolver(code, 0, &AgResolver { dex }).err()?;
+        Some((d, ci, pos, off, err))
+    })
 }
 
 /// (class_def index, position, code_off) of every method with a code_item,
